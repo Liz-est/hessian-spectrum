@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 import torchvision.models
+import torch.nn.init as init
+
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152']
 
 # you need to download the models to ~/.torch/models
@@ -155,9 +157,28 @@ class ResNet(nn.Module):
         x = self.fc(x)
 
         return x
+    
+    
+def _apply_hetero_trunc_init_conv(model, std_start=0.02, std_end=0.002, a=-2.0, b=2.0):
+    """
+    对模型中所有 Conv2d 的 weight 进行分层异质截断正态初始化：
+      - std 在 [std_start, std_end] 间按层序号线性变化（首层最大，越深越小）
+      - 只处理 Conv2d；BatchNorm/Linear 保持原逻辑
+    """
+    print("!!! hetero init is called")
+    convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
+    L = len(convs)
+    if L == 0:
+        return
+    for i, m in enumerate(convs):
+        t = 0.0 if L == 1 else i / (L - 1)
+        std_i = std_start + (std_end - std_start) * t
+        init.trunc_normal_(m.weight, mean=0.0, std=std_i, a=a, b=b)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
 
 
-def resnet18(pretrained=False, **kwargs):
+def resnet18(pretrained=False, hetero_init=False, **kwargs):
     """Constructs a ResNet-18 model.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
@@ -165,6 +186,11 @@ def resnet18(pretrained=False, **kwargs):
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
         model.load_state_dict(torch.load(os.path.join(models_dir, model_name['resnet18'])))
+        return model
+    
+    if hetero_init:
+        _apply_hetero_trunc_init_conv(model, std_start=2)
+        
     return model
 
 

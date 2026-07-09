@@ -134,3 +134,14 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# checkpoint
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.pkl
+*.h5
+*.joblib
+checkpoint/
+files/

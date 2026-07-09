@@ -1,4 +1,4 @@
-name: cvmodels
+name: hessian_spec
 channels:
   - pytorch
   - nvidia
@@ -103,7 +103,6 @@ dependencies:
   - tensorboard=2.11.0=py39h06a4308_0
   - tensorboard-data-server=0.6.0=py39hca6d32c_0
   - tensorboard-plugin-wit=1.8.1=py39h06a4308_0
-  - timm=0.4.12=py39h06a4308_0
   - tk=8.6.12=h1ccaba5_0
   - toolz=0.12.0=py39h06a4308_0
   - torchvision=0.14.1=py39_cu116
