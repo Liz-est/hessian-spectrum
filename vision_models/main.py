@@ -670,8 +670,9 @@ def interpolate_couple(weights1, values1, weights2, values2, window_extend, hess
         
     elif metric == "js":
         dx = grid[1]-grid[0]
-        distance = js_divergence_from_densities(density_avg1, density_avg2, dx) # Xinlu: 这里取的不是JS距离，是JS散度
-        
+        div = js_divergence_from_densities(density_avg1, density_avg2, dx) # Xinlu: 这里取的不是JS距离，是JS散度
+        distance = np.sqrt(div)
+
     else:
         assert 0
     
