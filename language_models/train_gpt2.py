@@ -49,7 +49,7 @@ init_from =   'scratch'#'resume'# 'scratch' or 'resume' or 'gpt2*'
 load_iter = 0
 
 # data
-dataset = 'openwebtext'
+dataset = 'synth_uniform_balanced' # relative to data/
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -59,6 +59,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+tie_weights = True # tie wte and lm_head. Set False to study last-layer Hessian independently.
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -67,6 +68,7 @@ beta1 = 0.9
 beta2 = 0.95
 epsilon = 1e-8
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+use_sgd = False # if True, use SGD(momentum=0.9); else AdamW. Set from config/CLI for the Adam-vs-SGD comparison.
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -135,15 +137,41 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+# NOTE: this copy lives in language_models/test_data/, one level deeper than the
+# original, so the relative path to the dataset gains an extra '..'.
+data_dir = os.path.join('..','..','data_construction','data', dataset)
 
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# Two supported on-disk formats:
+#   (A) legacy single-stream: train.bin / val.bin, target = input shifted by 1
+#       (as produced by NanoGPT's prepare scripts, e.g. openwebtext).
+#   (B) dual-stream:          train_x.bin + train_y.bin (and val_x/val_y),
+#       target stored explicitly. Produced by data_construction/build_dataset.py.
+#       This keeps y = shifted input by default but leaves room for an output
+#       distribution that is NOT a shift of the input.
+dual_stream = os.path.exists(os.path.join(data_dir, 'train_x.bin'))
+if dual_stream:
+    print(f"[data] dual-stream format detected in {data_dir}")
+    train_x = np.memmap(os.path.join(data_dir, 'train_x.bin'), dtype=np.uint16, mode='r')
+    train_y = np.memmap(os.path.join(data_dir, 'train_y.bin'), dtype=np.uint16, mode='r')
+    val_x = np.memmap(os.path.join(data_dir, 'val_x.bin'), dtype=np.uint16, mode='r')
+    val_y = np.memmap(os.path.join(data_dir, 'val_y.bin'), dtype=np.uint16, mode='r')
+    train_data = train_x  # kept so the Hessian class receives the input stream
+else:
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
 def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if dual_stream:
+        xdata = train_x if split == 'train' else val_x
+        ydata = train_y if split == 'train' else val_y
+        ix = torch.randint(len(xdata) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((xdata[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((ydata[i:i+block_size]).astype(np.int64)) for i in ix])
+    else:
+        data = train_data if split == 'train' else val_data
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -176,7 +204,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, flash_attn = flash_attn, device = device) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, flash_attn = flash_attn, device = device, tie_weights = tie_weights) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -232,7 +260,8 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, use_sgd=use_sgd)
+print(f"optimizer: {'SGD(momentum=0.9)' if use_sgd else 'AdamW'}, lr={learning_rate}")
 
 
 if init_from == 'resume':
@@ -290,7 +319,7 @@ def plot_hessian():
     gradient_accumulation_steps = 60
     use_minibatch = True
 
-    hessian = hessian_spectrum.Hessian(model, ckpt_iteration = load_iter, train_data = train_data, batch_size= batch_size, block_size= block_size,  ctx = ctx, use_minibatch = use_minibatch, gradient_accumulation_steps = gradient_accumulation_steps, device = device, sample_layer = sample_layer, comment = comment)
+    hessian = hessian_spectrum.Hessian(model, ckpt_iteration = load_iter, train_data = train_data, train_target = (train_y if dual_stream else None), batch_size= batch_size, block_size= block_size,  ctx = ctx, use_minibatch = use_minibatch, gradient_accumulation_steps = gradient_accumulation_steps, device = device, sample_layer = sample_layer, comment = comment)
 
     
 

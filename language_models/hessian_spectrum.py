@@ -13,12 +13,16 @@ import json
 
 
 class Hessian(object):
-    def __init__(self, model = None,  m = 100, sigma = 1e-5**0.5, ckpt_iteration= 0, train_data = [], block_size = None, batch_size = None, num_v = 10, ctx =nullcontext(), use_minibatch = True, gradient_accumulation_steps = 1, device = 'cuda',  sample_layer = None, ddp = False, comment = None):
+    def __init__(self, model = None,  m = 100, sigma = 1e-5**0.5, ckpt_iteration= 0, train_data = [], train_target = None, block_size = None, batch_size = None, num_v = 10, ctx =nullcontext(), use_minibatch = True, gradient_accumulation_steps = 1, device = 'cuda',  sample_layer = None, ddp = False, comment = None):
         self.model = model
         self.m = m # number of lanzcos basis
         self.sigma = sigma # the standard deviation of gaussian r.v.
         self.ckpt_iteration = ckpt_iteration
         self.train_data = train_data
+        # Optional explicit target stream (dual-stream datasets). When None we
+        # fall back to the legacy "target = input shifted by 1" convention so
+        # existing single-stream datasets (e.g. openwebtext) are unaffected.
+        self.train_target = train_target
         self.block_size = block_size
         self.batch_size = batch_size
         self.ctx = ctx
@@ -482,8 +486,13 @@ class Hessian(object):
         start_idx = batch_idx * self.batch_size * self.block_size
         end_idx = (batch_idx + 1) * self.batch_size * self.block_size
         X = torch.from_numpy((self.train_data[start_idx:end_idx]).astype(np.int64)).reshape(self.batch_size, self.block_size)
-        Y = torch.from_numpy((self.train_data[start_idx+1:end_idx+1]).astype(np.int64)).reshape(self.batch_size, self.block_size)
-       
+        if self.train_target is not None:
+            # dual-stream: target read from its own aligned stream (no shift)
+            Y = torch.from_numpy((self.train_target[start_idx:end_idx]).astype(np.int64)).reshape(self.batch_size, self.block_size)
+        else:
+            # legacy single-stream: target = input shifted by one
+            Y = torch.from_numpy((self.train_data[start_idx+1:end_idx+1]).astype(np.int64)).reshape(self.batch_size, self.block_size)
+
         X, Y = X.pin_memory().to(self.device, non_blocking=True), Y.pin_memory().to(self.device, non_blocking=True)
 
         return X, Y

@@ -148,3 +148,8 @@ files/
 
 # data
 /data_construction/data/
+
+# AI tools
+install_claude.sh
+.vscode/
+.claude_persist/
