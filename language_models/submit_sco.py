@@ -13,10 +13,9 @@ Notes
 * Dataset: train_gpt2.py reads ../../data_construction/data/<dataset> relative
   to the working directory (language_models/). Make sure the dataset is built
   BEFORE submitting -- the job does not build it.
-* USE_DDP: keep False for now. train_gpt2.py line ~277 currently wraps the
-  model in torch.nn.DataParallel instead of DDP, so a multi-process torchrun
-  launch would NOT sync gradients (8 independent runs). Revert that line to
-  `model = DDP(model, device_ids=[ddp_local_rank])` before setting USE_DDP=True.
+* Launches 8-GPU DDP via torchrun (train_gpt2.py has been fixed to use
+  DistributedDataParallel). The Hessian spectrum pass at startup runs on
+  rank 0 only; other ranks wait at a barrier.
 """
 
 import argparse
@@ -47,19 +46,16 @@ JOB_NAME = "zlx-gpt2-hessian-001"        # change per run, keep unique
 CONDA_SH = "/data/250010020/miniconda3/etc/profile.d/conda.sh"
 CONDA_ENV = "gpt2"                       # created from environment.yml on first run
 
-# Single-process (1 GPU) by default; see USE_DDP note in the docstring.
-USE_DDP = False
+# 8-GPU single-node DDP. gradient_accumulation_steps in the config (40)
+# must stay divisible by NPROC_PER_NODE (asserted in train_gpt2.py).
 NPROC_PER_NODE = 8
 
 TRAIN_ARGS = "config/train_gpt2_small.py --dataset=synth_uniform_balanced"
 
-if USE_DDP:
-    LAUNCH = (
-        f"torchrun --standalone --nproc_per_node={NPROC_PER_NODE} "
-        f"train_gpt2.py {TRAIN_ARGS}"
-    )
-else:
-    LAUNCH = f"python -u train_gpt2.py {TRAIN_ARGS}"
+LAUNCH = (
+    f"torchrun --standalone --nproc_per_node={NPROC_PER_NODE} "
+    f"train_gpt2.py {TRAIN_ARGS}"
+)
 
 # The command that runs inside the container: activate (creating if needed)
 # the gpt2 conda env, then launch training from language_models/ so that the
@@ -114,8 +110,7 @@ def main() -> None:
     print(f"Job name:   {JOB_NAME}")
     print(f"Worker spec:{WORKER_SPEC}")
     print(f"Work dir:   {WORK_DIR}")
-    print(f"DDP:        {USE_DDP} ({NPROC_PER_NODE} procs)" if USE_DDP
-          else "DDP:        off (single process, 1 GPU)")
+    print(f"DDP:        torchrun, {NPROC_PER_NODE} GPUs x {WORKER_NODES} node(s)")
     if not args.yes:
         if input("Continue? (y/n): ").strip().lower() != "y":
             print("Cancelled.")

@@ -20,13 +20,14 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from datetime import timedelta
 
 import numpy as np
 import json
 import hessian_spectrum
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, barrier
 
 from model import GPTConfig, GPT
 
@@ -104,7 +105,9 @@ os.makedirs(save_dir, exist_ok = True)
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
-    init_process_group(backend=backend)
+    # long timeout: rank 0 runs the Hessian spectrum alone while other ranks
+    # wait at a barrier, which can exceed the default NCCL timeout
+    init_process_group(backend=backend, timeout=timedelta(hours=6))
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -273,8 +276,7 @@ checkpoint = None # free up memory
 
 # wrap model into DDP container
 if ddp:
-    #model = DDP(model, device_ids=[ddp_local_rank])
-    model = torch.nn.DataParallel(model,  device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank])
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -313,22 +315,25 @@ X, Y = get_batch('train') # fetch the very first batch
 
 
 def plot_hessian():
-    
+    # Hessian spectrum estimation is single-process: run it on rank 0 only,
+    # on the raw (unwrapped) model; other ranks wait at the barrier.
+    if master_process:
+        raw_model = model.module if ddp else model
 
-    batch_size = 8
-    gradient_accumulation_steps = 60
-    use_minibatch = True
+        batch_size = 8
+        gradient_accumulation_steps = 60
+        use_minibatch = True
 
-    hessian = hessian_spectrum.Hessian(model, ckpt_iteration = load_iter, train_data = train_data, train_target = (train_y if dual_stream else None), batch_size= batch_size, block_size= block_size,  ctx = ctx, use_minibatch = use_minibatch, gradient_accumulation_steps = gradient_accumulation_steps, device = device, sample_layer = sample_layer, comment = comment)
+        hessian = hessian_spectrum.Hessian(raw_model, ckpt_iteration = load_iter, train_data = train_data, train_target = (train_y if dual_stream else None), batch_size= batch_size, block_size= block_size,  ctx = ctx, use_minibatch = use_minibatch, gradient_accumulation_steps = gradient_accumulation_steps, device = device, sample_layer = sample_layer, comment = comment)
 
-    
+        hessian.get_spectrum(layer_by_layer = True)
+        hessian.load_curve(layer_by_layer = True)
 
-    hessian.get_spectrum(layer_by_layer = True)
-    hessian.load_curve(layer_by_layer = True)
+        hessian.get_spectrum(layer_by_layer = False)
+        hessian.load_curve(layer_by_layer = False)
 
-
-    hessian.get_spectrum(layer_by_layer = False)
-    hessian.load_curve(layer_by_layer = False)
+    if ddp:
+        barrier()
 
 
 
