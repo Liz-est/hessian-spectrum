@@ -264,104 +264,103 @@ class Hessian(object):
         alpha_dic = {} # value: scaler
         w_dic = {} # value: #parameters*1 tensor
         beta_dic = {} # value: scaler
-        T_dic = {} # value: m*m tensor 
+        T_dic = {} # value: m*m tensor
         'initialize'
+        # Lanczos vectors live on GPU in fp32 (see tridiagonalize_by_lanzcos);
+        # T stays float64 for the eigendecomposition.
         for name, params in self.model.named_parameters():
             if name not in self.sample_layer:
                 continue
             if params.requires_grad:
-                v = torch.randn_like(params, dtype = torch.float64) 
+                v = torch.randn_like(params, dtype = torch.float32)
                 v /= torch.norm(v)
-                v_dic[name] = [v.cpu()]
+                v_dic[name] = [v]
                 T_dic[name] = np.zeros((self.m, self.m), dtype= np.float64)
 
 
-        w_prime_dic = self.hessian_vector_product_with_dic_input(v_dic, k,0) 
+        w_prime_dic = self.hessian_vector_product_with_dic_input(v_dic, k,0)
 
         'orthogonalize wprime'
         for name in T_dic.keys():
-            alpha_dic[name] = torch.sum(w_prime_dic[name] * v_dic[name][-1])  
+            alpha_dic[name] = torch.sum(w_prime_dic[name] * v_dic[name][-1])
             w_dic[name] = w_prime_dic[name] - alpha_dic[name] * v_dic[name][-1]
-            T_dic[name][0, 0] = alpha_dic[name] 
+            T_dic[name][0, 0] = alpha_dic[name].item()
 
         'iteration'
         print('runing lanczos')
         for j in range(1, self.m):
 
-            for name in T_dic.keys(): 
+            for name in T_dic.keys():
                 beta = torch.norm(w_dic[name])
                 beta_dic[name] = beta
-                if beta >1e-8:
+                # 1e-6 threshold: fp32 machine epsilon is ~1.2e-7, values
+                # below that are rounding noise
+                if beta > 1e-6:
                     v_dic[name].append( w_dic[name] / beta )
                 else:
-                    #print('The value of beta is 0')
-                    v_dic[name].append( w_dic[name] / 1e-8 )
-                    #raise ZeroDivisionError('The value of beta is 0')
+                    v_dic[name].append( w_dic[name] / 1e-6 )
                 if len(v_dic[name]) > 2:
                     del v_dic[name][0]  # keep this list short to save memory
 
             t_hessian = time.time()
-  
-            w_prime_dic = self.hessian_vector_product_with_dic_input(v_dic, k,j) 
+
+            w_prime_dic = self.hessian_vector_product_with_dic_input(v_dic, k,j)
             print('t for hessian', time.time() - t_hessian)
 
             'orthogonalize wprime'
             for name in T_dic.keys():
-                alpha_dic[name] = torch.sum(w_prime_dic[name] * v_dic[name][-1])  
+                alpha_dic[name] = torch.sum(w_prime_dic[name] * v_dic[name][-1])
                 w_dic[name] = w_prime_dic[name] - alpha_dic[name] * v_dic[name][-1] - beta_dic[name] * v_dic[name][-2]
-                T_dic[name][j, j] = alpha_dic[name] 
-                T_dic[name][j-1, j ] = beta_dic[name] 
-                T_dic[name][j , j-1] = beta_dic[name]
+                T_dic[name][j, j] = alpha_dic[name].item()
+                T_dic[name][j-1, j ] = beta_dic[name].item()
+                T_dic[name][j , j-1] = beta_dic[name].item()
 
         return  T_dic
 
 
     def tridiagonalize_by_lanzcos(self, k):
         'set up'
+        # Lanczos vectors live on GPU in fp32: the HVP is computed in fp32
+        # anyway (model precision), so fp64 recursion adds no accuracy, only
+        # CPU<->GPU traffic. T stays float64 for the (cheap) eigendecomposition.
         v_list = []
         T = np.zeros((self.m, self.m), dtype= np.float64)
 
         'initialization'
-        v = torch.randn(self.total_params, dtype = torch.float64) 
+        v = torch.randn(self.total_params, dtype = torch.float32, device = self.device)
         v /= torch.norm(v)
-        v_list.append(v.cpu())
+        v_list.append(v)
 
 
         w_prime = self.hessian_vector_product_with_tensor_input(v_list[-1], k,0)
         'orthogonalize wprime'
         alpha = torch.sum(w_prime * v_list[-1])
         w = w_prime - alpha * v_list[-1]
-        T[0, 0] = alpha
+        T[0, 0] = alpha.item()
 
         'iteration'
         #t_s = time.time()
         print('runing lanczos')
         for j in range(1, self.m):
             beta = torch.norm(w)
-            if beta >1e-8:
+            # 1e-6 threshold: fp32 machine epsilon is ~1.2e-7, values below
+            # that are rounding noise
+            if beta > 1e-6:
                 v_list.append(w / beta)
-
             else:
-                v_list.append(w / 1e-8)
+                v_list.append(w / 1e-6)
 
-                # print(f' since beta = {beta}, generate v that orthogonal to all previous v')
-                # # Generate a random vector orthogonal to previous ones
-                # v = torch.randn(self.total_params) *(1/self.total_params)**0.5
-                # for i in range(j):
-                #     vi = v_list[i]
-                #     v -= torch.sum(vi * v) * vi
-                # v /= torch.norm(v)
-                if len(v_list) > 2:
-                    del v_list[0]  # keep this list short to save memory
+            if len(v_list) > 2:
+                del v_list[0]  # keep this list short to save memory
 
 
             w_prime = self.hessian_vector_product_with_tensor_input(v_list[-1], k,j)
             alpha = torch.sum(w_prime* v_list[-1])
             w = w_prime - alpha * v_list[-1] - beta * v_list[-2]
-            T[j, j] = alpha
-            T[j-1, j ] = beta
-            T[j , j-1] = beta
-         
+            T[j, j] = alpha.item()
+            T[j-1, j ] = beta.item()
+            T[j , j-1] = beta.item()
+
         return  T
 
 
@@ -391,18 +390,19 @@ class Hessian(object):
         self.model.zero_grad(set_to_none = True)
 
         'initialize'
+        # fp32 accumulators on GPU (same device/dtype as the gradients)
         hd_dic = {}
         for name, param in self.model.named_parameters():
             if name not in self.sample_layer:
                 continue
             if param.requires_grad:
-                hd_dic[name]  = torch.zeros_like(param.data).cpu()
+                hd_dic[name]  = torch.zeros_like(param.data)
 
 
         t_hd = time.time()
         for batch_idx in range(self.num_batches):
 
-            
+
             X, Y = self.get_batch(batch_idx)
             with self.ctx:
                 _, loss = self.model(X, Y)
@@ -413,18 +413,17 @@ class Hessian(object):
                 if name not in self.sample_layer:
                     continue
                 if param.requires_grad:
-                    g_dic[name] = param.grad.double()
+                    g_dic[name] = param.grad
 
-        
+
             self.model.zero_grad(set_to_none = True)
             for name, param in self.model.named_parameters():
                 if name not in self.sample_layer:
                     continue
                 if param.requires_grad:
-                    l = torch.sum(g_dic[name].cuda() * d_dic[name][-1].cuda())
+                    l = torch.sum(g_dic[name] * d_dic[name][-1])
                     l.backward(retain_graph = True)
-                    hd = param.grad.double().data.clone()
-                    hd_dic[name]  += hd.cpu()   
+                    hd_dic[name]  += param.grad.data
                     self.model.zero_grad(set_to_none = True)
 
             if batch_idx % 10 == 1 or batch_idx == self.gradient_accumulation_steps-1:
@@ -439,10 +438,11 @@ class Hessian(object):
     def hessian_vector_product_with_tensor_input(self, d_tensor, v_step, l_step):
         'comput hessian_vector product, takes a flattened tensors as input (with shape (total parameters, ) )'
 
-        d_tensor = d_tensor.cuda()
         self.model.eval()
         self.model.zero_grad(set_to_none = True)
-        total_hd_tensor = 0
+        # fp32 accumulator on GPU: gradients are fp32 already, casting to
+        # double / staging on CPU only added transfer overhead
+        total_hd_tensor = torch.zeros(self.total_params, dtype = torch.float32, device = self.device)
 
         t_hd = time.time()
         for batch_idx in range(self.num_batches):
@@ -455,23 +455,21 @@ class Hessian(object):
             g_list = []
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    g_list.append(torch.flatten(param.grad.double()))
+                    g_list.append(torch.flatten(param.grad))
 
             g_tensor = torch.cat(g_list, dim = 0)
-            
+
             self.model.zero_grad(set_to_none = True)
-            g_tensor = g_tensor.cuda()
             l = torch.sum(g_tensor*d_tensor)
             l.backward(retain_graph = True)
 
             hd_list = []
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    hd_list.append(torch.flatten(param.grad.double().data.clone()))
+                    hd_list.append(torch.flatten(param.grad.data))
 
             hd_tensor = torch.cat(hd_list, dim = 0)
             self.model.zero_grad(set_to_none = True)
-            hd_tensor = hd_tensor.cpu()
             total_hd_tensor += hd_tensor
 
             if batch_idx % 10 == 1 or batch_idx == self.gradient_accumulation_steps-1:
