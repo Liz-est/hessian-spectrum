@@ -1,5 +1,5 @@
 """
-toy_model_C: single-layer vanilla decoder-only Transformer (方案 C).
+vanilla_transformer: single-layer vanilla decoder-only Transformer (方案 C).
 
 Config: d=192, h=6, d_head=32, d_ff=1024, V=1024, context=128.
 Post-LayerNorm, ReLU FFN, fixed sinusoidal PE, linear bias on, embed/head untied.
@@ -31,7 +31,7 @@ if __name__ == "__main__":
         v = bd[key]
         print(f"  {label:<20}: {v:>9,} ({v/1e6:.3f}M, {100*v/total:.1f}%)")
 
-    print(f"toy_model_C total params : {total:,} ({total/1e6:.3f}M)")
+    print(f"vanilla_transformer total params : {total:,} ({total/1e6:.3f}M)")
     row("Token Embedding", "token_embedding")
     row("LM Head", "lm_head")
     row("Embedding + LM Head", "embed+head")

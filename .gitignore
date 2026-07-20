@@ -148,8 +148,16 @@ files/
 
 # data
 /data_construction/data/
+/data
 
 # AI tools
 install_claude.sh
 .vscode/
 .claude_persist/
+.claude/settings.local.json
+
+# runs
+/toy_models/runs
+
+# sco
+sco-backup/
