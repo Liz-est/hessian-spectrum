@@ -52,6 +52,7 @@ cfg = cfgmod.apply_overrides(cfgmod.load(), sys.argv[1:])
 
 model_cfg = cfg.to_model_config()
 dataset = cfg.data.dataset
+data_format = cfg.data.format
 batch_size = cfg.data.batch_size
 block_size = model_cfg.block_size
 max_iters = cfg.train.max_iters
@@ -61,6 +62,26 @@ log_interval = cfg.train.log_interval
 seed = cfg.train.seed
 grad_clip = cfg.optim.grad_clip
 out_dir = os.path.join(HERE, "runs", cfg.train.run_name)
+
+
+# modded-nanoGPT shard header: 256 int32 = 1024 bytes, then uint16 tokens.
+HEADER_BYTES = 256 * 4
+
+
+def load_shards(pattern):
+    """Memmap every shard matching `pattern` (uint16 token stream, header skipped)."""
+    import glob
+    paths = sorted(glob.glob(pattern))
+    assert paths, f"no shards found for {pattern}"
+    shards = []
+    for p in paths:
+        header = np.fromfile(p, dtype=np.int32, count=256)
+        assert header[0] == 20240520, f"bad magic in {p}: {header[0]}"
+        ntok = int(header[2])
+        toks = np.memmap(p, dtype=np.uint16, mode="r", offset=HEADER_BYTES)
+        assert len(toks) >= ntok, f"{p}: {len(toks)} < declared {ntok}"
+        shards.append(toks[:ntok])
+    return shards
 
 
 def setup_dist():
@@ -93,17 +114,38 @@ def main():
               f"max_iters={max_iters}  bs={batch_size}x{world}")
 
     data_dir = os.path.join(REPO_ROOT, "data", dataset)
-    train_x = np.memmap(os.path.join(data_dir, "train_x.bin"), dtype=np.uint16, mode="r")
-    train_y = np.memmap(os.path.join(data_dir, "train_y.bin"), dtype=np.uint16, mode="r")
-    val_x = np.memmap(os.path.join(data_dir, "val_x.bin"), dtype=np.uint16, mode="r")
-    val_y = np.memmap(os.path.join(data_dir, "val_y.bin"), dtype=np.uint16, mode="r")
+    if data_format == "nanogpt_shards":
+        # fineweb-style single token stream; targets are inputs shifted by one.
+        train_shards = load_shards(os.path.join(data_dir, "fineweb_train_*.bin"))
+        val_shards = load_shards(os.path.join(data_dir, "fineweb_val_*.bin"))
+        if is_master:
+            n_train_tok = sum(len(s) for s in train_shards)
+            print(f"train: {len(train_shards)} shards, {n_train_tok/1e9:.3f}B tokens; "
+                  f"val: {len(val_shards)} shard(s)")
+        _rng = np.random.default_rng(seed + rank)
 
-    def get_batch(split):
-        xd, yd = (train_x, train_y) if split == "train" else (val_x, val_y)
-        ix = torch.randint(len(xd) - block_size, (batch_size,))
-        x = torch.stack([torch.from_numpy(xd[i:i + block_size].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(yd[i:i + block_size].astype(np.int64)) for i in ix])
-        return x.to(device), y.to(device)
+        def get_batch(split):
+            shards = train_shards if split == "train" else val_shards
+            shard = shards[_rng.integers(len(shards))]
+            ix = _rng.integers(0, len(shard) - block_size - 1, size=batch_size)
+            x = torch.from_numpy(
+                np.stack([shard[i:i + block_size].astype(np.int64) for i in ix]))
+            y = torch.from_numpy(
+                np.stack([shard[i + 1:i + 1 + block_size].astype(np.int64) for i in ix]))
+            return x.to(device), y.to(device)
+    else:
+        # dual-stream synth bigram data: x and y stored in separate .bin files.
+        train_x = np.memmap(os.path.join(data_dir, "train_x.bin"), dtype=np.uint16, mode="r")
+        train_y = np.memmap(os.path.join(data_dir, "train_y.bin"), dtype=np.uint16, mode="r")
+        val_x = np.memmap(os.path.join(data_dir, "val_x.bin"), dtype=np.uint16, mode="r")
+        val_y = np.memmap(os.path.join(data_dir, "val_y.bin"), dtype=np.uint16, mode="r")
+
+        def get_batch(split):
+            xd, yd = (train_x, train_y) if split == "train" else (val_x, val_y)
+            ix = torch.randint(len(xd) - block_size, (batch_size,))
+            x = torch.stack([torch.from_numpy(xd[i:i + block_size].astype(np.int64)) for i in ix])
+            y = torch.stack([torch.from_numpy(yd[i:i + block_size].astype(np.int64)) for i in ix])
+            return x.to(device), y.to(device)
 
     model = ToyVanilla(model_cfg).to(device)
     raw_model = model
@@ -148,7 +190,9 @@ def main():
         print(f"  saved checkpoint {path} (iter {it})")
 
     log_path = os.path.join(out_dir, "loss_log.csv")
+    val_log_path = os.path.join(out_dir, "val_loss_log.csv")
     log_rows = []
+    val_rows = []
 
     model.train()
     t0 = time.time()
@@ -162,6 +206,7 @@ def main():
 
         if it % eval_interval == 0 and is_master:
             vloss = eval_val()
+            val_rows.append((it, vloss))
             print(f"iter {it}: val loss {vloss:.4f}  (lr {get_lr(it):.2e}, {time.time()-t0:.1f}s)")
 
         if it == max_iters:
@@ -187,13 +232,23 @@ def main():
             w.writerows(log_rows)
         print("wrote", log_path)
 
+        with open(val_log_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["iter", "val_loss"])
+            w.writerows(val_rows)
+        print("wrote", val_log_path)
+
         if log_rows:
             its = [r[0] for r in log_rows]
             ls = [r[1] for r in log_rows]
             plt.figure(figsize=(7, 4.5))
-            plt.plot(its, ls, lw=1.2)
-            plt.xlabel("iteration"); plt.ylabel("train loss (cross-entropy)")
-            plt.title("vanilla_transformer training loss")
+            plt.plot(its, ls, lw=1.2, label="train")
+            if val_rows:
+                plt.plot([r[0] for r in val_rows], [r[1] for r in val_rows],
+                         lw=1.2, marker="o", ms=3, label="val")
+            plt.xlabel("iteration"); plt.ylabel("loss (cross-entropy)")
+            plt.title(f"{cfg.train.run_name} loss")
+            plt.legend()
             plt.grid(alpha=0.3); plt.tight_layout()
             fig_path = os.path.join(out_dir, "loss_curve.png")
             plt.savefig(fig_path, dpi=150); plt.close()

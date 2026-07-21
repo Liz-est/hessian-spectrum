@@ -31,6 +31,7 @@ class ToyVanillaConfig:
     head_dim: int = 32         # d_head (h * head_dim == n_embd here)
     n_ffn: int = 1024          # FFN inner size d_ff
     n_layer: int = 1           # single-layer decoder
+    block_type: str = "transformer"  # "transformer" (attn+FFN) | "mlp" (FFN+FFN)
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
@@ -86,10 +87,18 @@ class FFN(nn.Module):
 
 
 class Block(nn.Module):
-    """Post-LayerNorm block: x = LN(x + sublayer(x))."""
+    """Post-LayerNorm block: x = LN(x + sublayer(x)).
+
+    The first sub-layer is attention for a "transformer" block, or a second FFN
+    for an "mlp" block (an MLP-only model). Both have the same n_embd->n_embd
+    shape, so it is a drop-in swap and forward() is identical either way. The
+    attribute stays `self.attn` so checkpoints and the analyzer's blocks.<i>.attn
+    path prefix are unchanged regardless of block_type.
+    """
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = FFN(config) if config.block_type == "mlp" \
+            else CausalSelfAttention(config)
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.mlp = FFN(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)

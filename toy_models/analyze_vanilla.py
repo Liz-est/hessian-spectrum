@@ -61,6 +61,7 @@ cfg = cfgmod.apply_overrides(cfgmod.load(), sys.argv[1:])
 
 model_cfg = cfg.to_model_config()
 dataset = cfg.data.dataset
+data_format = cfg.data.format
 run_dir = os.path.join(HERE, "runs", cfg.train.run_name)     # where ckpt_*.pt live
 out_dir = os.path.join(HERE, "files", cfg.analyze.files_name)  # eigs/hetero npy + figures
 batch_size = cfg.analyze.batch_size
@@ -74,7 +75,8 @@ seed = cfg.analyze.seed
 TAGS = sorted(cfg.train.ckpt_fracs.items(), key=lambda kv: kv[1])
 
 LAYER_SPEC = default_layer_spec(model_cfg.n_head, model_cfg.head_dim,
-                                n_layer=model_cfg.n_layer)
+                                n_layer=model_cfg.n_layer,
+                                block_type=model_cfg.block_type)
 LAYER_NAMES = [d for (d, _, _) in LAYER_SPEC]
 
 
@@ -100,6 +102,32 @@ def setup_dist():
 
 def make_get_batch(block_size, device):
     data_dir = os.path.join(REPO_ROOT, "data", dataset)
+    if data_format == "nanogpt_shards":
+        # fineweb-style single token stream; targets are inputs shifted by one.
+        import glob
+        HEADER_BYTES = 256 * 4
+        paths = sorted(glob.glob(os.path.join(data_dir, "fineweb_train_*.bin")))
+        assert paths, f"no shards found in {data_dir}"
+        shards = []
+        for p in paths:
+            header = np.fromfile(p, dtype=np.int32, count=256)
+            assert header[0] == 20240520, f"bad magic in {p}: {header[0]}"
+            ntok = int(header[2])
+            toks = np.memmap(p, dtype=np.uint16, mode="r", offset=HEADER_BYTES)
+            shards.append(toks[:ntok])
+        rng = np.random.default_rng(seed)
+
+        def get_batch():
+            shard = shards[rng.integers(len(shards))]
+            ix = rng.integers(0, len(shard) - block_size - 1, size=batch_size)
+            x = torch.from_numpy(
+                np.stack([shard[i:i + block_size].astype(np.int64) for i in ix]))
+            y = torch.from_numpy(
+                np.stack([shard[i + 1:i + 1 + block_size].astype(np.int64) for i in ix]))
+            return x.to(device), y.to(device)
+        return get_batch
+
+    # dual-stream synth bigram data: x and y stored in separate .bin files.
     xd = np.memmap(os.path.join(data_dir, "train_x.bin"), dtype=np.uint16, mode="r")
     yd = np.memmap(os.path.join(data_dir, "train_y.bin"), dtype=np.uint16, mode="r")
     g = torch.Generator().manual_seed(seed)
