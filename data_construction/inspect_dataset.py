@@ -30,11 +30,17 @@ def main(out_dir, do_plot=True):
     pi = np.asarray(meta["pi"])
     P = np.asarray(meta["P"])
 
-    x = np.fromfile(os.path.join(out_dir, "train_x.bin"), dtype=np.uint16)
-    y = np.fromfile(os.path.join(out_dir, "train_y.bin"), dtype=np.uint16)
+    # memmap instead of fromfile: the 1B-token streams are ~2GB each and
+    # loading them wholesale gets the process OOM-killed
+    x = np.memmap(os.path.join(out_dir, "train_x.bin"), dtype=np.uint16, mode="r")
+    y_size = os.path.getsize(os.path.join(out_dir, "train_y.bin")) // np.dtype(np.uint16).itemsize
 
-    # --- empirical unigram vs target pi ----------------------------------- #
-    emp = np.bincount(x, minlength=V).astype(np.float64)
+    # --- empirical unigram vs target pi (chunked bincount) ----------------- #
+    counts = np.zeros(V, dtype=np.int64)
+    chunk = 64 * 1024 * 1024  # 64M tokens = 128MB per read
+    for i in range(0, x.size, chunk):
+        counts += np.bincount(x[i:i + chunk], minlength=V)
+    emp = counts.astype(np.float64)
     emp /= emp.sum()
     tv = 0.5 * np.abs(emp - pi).sum()
 
@@ -50,7 +56,7 @@ def main(out_dir, do_plot=True):
         s = meta["config"].get("shift", 1)
         # for shift mode, y should equal x advanced by s (on the raw stream);
         # here we just report that the streams have the expected length offset
-        consistent = f"shift={s}, len(x)={x.size:,}, len(y)={y.size:,}"
+        consistent = f"shift={s}, len(x)={x.size:,}, len(y)={y_size:,}"
 
     print(f"=== inspect {out_dir} ===")
     print(f"vocab_size            : {V}")
