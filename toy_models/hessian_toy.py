@@ -39,7 +39,7 @@ For each layer we get one block per unit, eigendecompose each, and:
   (2) turn each unit's spectrum into a log-eigenvalue probability histogram and
       compute pairwise Symmetric-KL and JS-distance matrices -> "hessian hetero".
 
-Outputs land under files/toy_C/<tag>/ (tag in {init,p10,p50,p100}).
+Outputs land under files/toy_C/<tag>/ (tag in {init,p10,p25,p40,p50,p60,p75,p85,p100}).
 """
 
 import os
@@ -127,6 +127,32 @@ def hetero_mean(D):
     n = D.shape[0]
     idx = np.tril_indices(n, k=-1)
     return float(D[idx].mean()) if len(idx[0]) else 0.0
+
+
+def cross_layer_matrices(save_dir, layer_names, num_bins=64, device="cpu"):
+    """Cross-LAYER heterogeneity: pool each layer's per-unit eigenvalues into
+    one spectrum, histogram all layers on shared log edges, and compute the
+    pairwise layer-vs-layer Symmetric-KL / JS-distance matrices.
+
+    Reads eigs_<layer>.npy from save_dir (skipping layers not yet computed) and
+    saves hetero_layers_{skl,js}.npy next to them. Returns (layers, {"skl": D,
+    "js": D}), or None if fewer than two layers have saved eigenvalues."""
+    layers, rows = [], []
+    for disp in layer_names:
+        ef = os.path.join(save_dir, f"eigs_{disp}.npy")
+        if os.path.exists(ef):
+            layers.append(disp)
+            rows.append(np.load(ef).ravel())
+    if len(layers) < 2:
+        return None
+    edges = common_log_edges(rows, num_bins)
+    P = spectra_to_prob(rows, edges)
+    mats = {}
+    for metric in ("skl", "js"):
+        D = pairwise_matrix(P, metric, device=device)
+        np.save(os.path.join(save_dir, f"hetero_layers_{metric}.npy"), D)
+        mats[metric] = D
+    return layers, mats
 
 
 def _eigvalsh(mat_np, device="cpu"):
@@ -307,18 +333,31 @@ class NeuronHessian:
 # ----------------------------------------------------------------------------
 # layer spec: display name -> how to block it
 # ----------------------------------------------------------------------------
-def default_layer_spec(n_head, head_dim):
-    """Return an ordered list of (display_name, kind, kwargs) analysis items."""
-    return [
-        ("embedding", "token",  {"path": "tok_emb"}),
-        ("attn_wq",   "head",   {"path": "blocks.0.attn.wq"}),
-        ("attn_wk",   "head",   {"path": "blocks.0.attn.wk"}),
-        ("attn_wv",   "neuron", {"path": "blocks.0.attn.wv"}),
-        ("attn_proj", "neuron", {"path": "blocks.0.attn.wo"}),
-        ("mlp_fc",    "neuron", {"path": "blocks.0.mlp.c_fc"}),
-        ("mlp_proj",  "neuron", {"path": "blocks.0.mlp.c_proj"}),
-        ("lm_head",   "class",  {"path": "lm_head"}),
-    ]
+def default_layer_spec(n_head, head_dim, n_layer=1):
+    """Return an ordered list of (display_name, kind, kwargs) analysis items.
+
+    embedding and lm_head always exist. The per-block attention / MLP layers
+    are only emitted for models that actually have transformer blocks
+    (n_layer >= 1); with n_layer == 0 (embed + lm_head only) they are omitted,
+    so the analyzer never tries to load or plot layers that don't exist.
+    """
+    spec = [("embedding", "token", {"path": "tok_emb"})]
+    for li in range(n_layer):
+        p = f"blocks.{li}.attn"
+        m = f"blocks.{li}.mlp"
+        # display names keep the block index only when there is more than one
+        # block, so the single-block case reads exactly as before.
+        pre = "" if n_layer == 1 else f"b{li}_"
+        spec += [
+            (f"{pre}attn_wq",   "head",   {"path": f"{p}.wq"}),
+            (f"{pre}attn_wk",   "head",   {"path": f"{p}.wk"}),
+            (f"{pre}attn_wv",   "neuron", {"path": f"{p}.wv"}),
+            (f"{pre}attn_proj", "neuron", {"path": f"{p}.wo"}),
+            (f"{pre}mlp_fc",    "neuron", {"path": f"{m}.c_fc"}),
+            (f"{pre}mlp_proj",  "neuron", {"path": f"{m}.c_proj"}),
+        ]
+    spec.append(("lm_head", "class", {"path": "lm_head"}))
+    return spec
 
 
 def compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,

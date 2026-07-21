@@ -1,26 +1,30 @@
 """
 Train vanilla_transformer (single-layer vanilla decoder) on the synthetic bigram data,
-log the loss curve, and checkpoint at 0% / 10% / 50% / 100% of training so the
-Hessian analysis (analyze_vanilla.py) can be run at each stage.
+log the loss curve, and checkpoint at the fractions of training named in the
+experiment config's ckpt_fracs, so the Hessian analysis (analyze_vanilla.py)
+can be run at each stage.
 
-Run from the toy_models/ directory:
-    python3 train_vanilla_transformer.py                 # single process (CPU or 1 GPU)
-    python3 train_vanilla_transformer.py --max_iters=40  # quick smoke test
+All settings come from the config package (config/schema.py + presets.py):
+
+    python3 train_vanilla_transformer.py                      # default preset
+    python3 train_vanilla_transformer.py imbalance_s1_adamw   # a named preset
+    python3 train_vanilla_transformer.py --train.max_iters=40 # quick smoke test
+    python3 train_vanilla_transformer.py --optim.name=adamw --lr.learning_rate=3e-4
     torchrun --standalone --nproc_per_node=8 train_vanilla_transformer.py   # 8-GPU DDP
 
-The dataset is the V=1024 dual-stream synth data at
-    <repo-root>/data/synth_uniform_balanced_V1024/
-(token ids 0..1023, matching model C's vocab).
+The dataset name lives in cfg.data.dataset and resolves to
+    <repo-root>/data/<dataset>/
+(token ids 0..vocab-1, matching model C's vocab).
 
-Under DDP the per-GPU batch is `batch_size`; the effective batch is
+Under DDP the per-GPU batch is cfg.data.batch_size; the effective batch is
 batch_size * world_size. Rank 0 evaluates, logs, and writes checkpoints.
 """
 
 import os
 import sys
 import time
-import math
 import csv
+from dataclasses import asdict
 
 # Cap CPU threads (only matters for the CPU path; harmless on GPU).
 os.environ.setdefault("OMP_NUM_THREADS", "8")
@@ -34,42 +38,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from vanilla_transformer import config_C
 from vanilla_model import ToyVanilla
+import config as cfgmod
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 
 # ----------------------------------------------------------------------------
-# config (override any of these from the CLI as --key=value)
+# config: select a preset (optional bare arg) + --group.key=value overrides.
+# All experiment settings now live in the config package, not module globals.
 # ----------------------------------------------------------------------------
-dataset = "synth_zipf_imbalanced_s1_V1024"
-batch_size = 64
-block_size = config_C.block_size          # 128, the model context length
-max_iters = 8000                          # 100% of training
-warmup_iters = 200
-learning_rate = 6e-4
-min_lr = 3e-5
-weight_decay = 0.1
-beta1, beta2 = 0.9, 0.95
-grad_clip = 1.0
-decay_lr = True
-eval_interval = 200
-eval_iters = 100
-log_interval = 20
-seed = 1337
-out_dir = os.path.join(HERE, "runs", "vanilla_imbalance_s1")
+cfg = cfgmod.apply_overrides(cfgmod.load(), sys.argv[1:])
 
-# checkpoints at these fractions of training (init / 10% / 50% / 100%)
-ckpt_fracs = {"init": 0.0, "p10": 0.10, "p50": 0.50, "p100": 1.0}
-
-# ---- minimal CLI override (--key=value) ------------------------------------
-for arg in sys.argv[1:]:
-    assert arg.startswith("--") and "=" in arg, f"bad arg {arg}"
-    key, val = arg[2:].split("=", 1)
-    assert key in globals(), f"unknown config key {key}"
-    cur = globals()[key]
-    globals()[key] = type(cur)(val) if not isinstance(cur, bool) else (val == "True")
+model_cfg = cfg.to_model_config()
+dataset = cfg.data.dataset
+batch_size = cfg.data.batch_size
+block_size = model_cfg.block_size
+max_iters = cfg.train.max_iters
+eval_interval = cfg.train.eval_interval
+eval_iters = cfg.train.eval_iters
+log_interval = cfg.train.log_interval
+seed = cfg.train.seed
+grad_clip = cfg.optim.grad_clip
+out_dir = os.path.join(HERE, "runs", cfg.train.run_name)
 
 
 def setup_dist():
@@ -97,6 +88,9 @@ def main():
     np.random.seed(seed + rank)
     if is_master:
         os.makedirs(out_dir, exist_ok=True)
+        print(f"experiment: {cfg.name}  optim={cfg.optim.name}  "
+              f"lr={cfg.lr.learning_rate}({cfg.lr.scheduler})  "
+              f"max_iters={max_iters}  bs={batch_size}x{world}")
 
     data_dir = os.path.join(REPO_ROOT, "data", dataset)
     train_x = np.memmap(os.path.join(data_dir, "train_x.bin"), dtype=np.uint16, mode="r")
@@ -111,7 +105,7 @@ def main():
         y = torch.stack([torch.from_numpy(yd[i:i + block_size].astype(np.int64)) for i in ix])
         return x.to(device), y.to(device)
 
-    model = ToyVanilla(config_C).to(device)
+    model = ToyVanilla(model_cfg).to(device)
     raw_model = model
     if is_ddp:
         ddp_kwargs = {"device_ids": [int(os.environ.get("LOCAL_RANK", rank))]} \
@@ -123,19 +117,10 @@ def main():
         model = DDP(model, broadcast_buffers=False, **ddp_kwargs)
         raw_model = model.module
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
-                                  betas=(beta1, beta2), weight_decay=weight_decay)
-
-    def get_lr(it):
-        if not decay_lr:
-            return learning_rate
-        if it < warmup_iters:
-            return learning_rate * (it + 1) / warmup_iters
-        if it > max_iters:
-            return min_lr
-        ratio = (it - warmup_iters) / max(1, (max_iters - warmup_iters))
-        coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
-        return min_lr + coeff * (learning_rate - min_lr)
+    # optimizer + LR schedule are built from the config (name-dispatched),
+    # so switching sgd<->adamw or cosine<->constant is a config change only.
+    optimizer = cfgmod.build_optimizer(model.parameters(), cfg.optim)
+    get_lr = cfgmod.make_lr_fn(cfg.lr, max_iters)
 
     @torch.no_grad()
     def eval_val():
@@ -150,7 +135,7 @@ def main():
         raw_model.train()
         return losses.mean().item()
 
-    ckpt_iters = {name: round(frac * max_iters) for name, frac in ckpt_fracs.items()}
+    ckpt_iters = cfg.ckpt_iters()   # tag -> iter, with a collision guard
     iter_to_tag = {it: name for name, it in ckpt_iters.items()}
     if is_master:
         print("checkpoint schedule (iter -> tag):", ckpt_iters)
@@ -158,7 +143,8 @@ def main():
     def save_ckpt(tag, it):
         path = os.path.join(out_dir, f"ckpt_{tag}.pt")
         torch.save({"model": raw_model.state_dict(), "iter_num": it,
-                    "tag": tag, "config": config_C.__dict__}, path)
+                    "tag": tag, "config": model_cfg.__dict__,
+                    "experiment": asdict(cfg)}, path)
         print(f"  saved checkpoint {path} (iter {it})")
 
     log_path = os.path.join(out_dir, "loss_log.csv")

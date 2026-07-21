@@ -6,20 +6,27 @@ Blocking (per the experiment spec):
   * V, attn.proj, mlp.fc, mlp.proj -> per output neuron
   * embedding, lm_head             -> per token
 
-Outputs:
-  1. loss curve                    -> runs/toy_C/loss_curve.png (train_vanilla_transformer.py)
-  2. Hessian spectrum (ESD)        -> files/toy_C/<tag>/spectrum_<layer>.png
-  3. per-token / last-layer hetero -> files/toy_C/<tag>/hetero_<layer>_{skl,js}.png
-  4. per-head / per-neuron hetero  -> files/toy_C/<tag>/hetero_<layer>_{skl,js}.png
-  5. hetero-vs-epoch evolution     -> files/toy_C/evolution_{skl,js}.png
-     (init / 10% / 50% / 100% on the x-axis, one line per analyzed layer)
+Outputs (RUN = cfg.analyze.files_name, set by the experiment preset):
+  1. loss curve                    -> runs/<RUN>/loss_curve.png (train_vanilla_transformer.py)
+  2. Hessian spectrum (ESD)        -> files/<RUN>/<tag>/spectrum_<layer>.png
+  3. per-token / last-layer hetero -> files/<RUN>/<tag>/hetero_<layer>_{skl,js}.png
+  4. per-head / per-neuron hetero  -> files/<RUN>/<tag>/hetero_<layer>_{skl,js}.png
+  5. cross-LAYER hetero heatmap    -> files/<RUN>/<tag>/hetero_layers_{skl,js}.png
+     (pairwise distance between the pooled spectra of all analyzed layers)
+  6. hetero-vs-epoch evolution     -> files/<RUN>/evolution_{skl,js}.png
+     (one x tick per checkpoint tag in cfg.train.ckpt_fracs, one line per layer)
+  7. cross-layer hetero evolution  -> files/<RUN>/evolution_layers_{skl,js}.png
 
 Runs on CPU (single process) or on 8 GPUs (torchrun). Under torchrun the
 (checkpoint, layer) work items are sharded across ranks; every rank writes its
 own eigs_*.npy / hetero_*.npy, then rank 0 renders all figures after a barrier.
+Settings come from the config package -- select a preset / override fields the
+same way as the trainer, e.g.:
 
     cd toy_models
-    python3 analyze_vanilla.py                                   # single process
+    python3 analyze_vanilla.py                                   # default preset
+    python3 analyze_vanilla.py imbalance_s1_adamw                # a named preset
+    python3 analyze_vanilla.py --analyze.max_classes=1024        # full-vocab lm_head
     torchrun --standalone --nproc_per_node=8 analyze_vanilla.py  # 8-GPU sharded
 """
 
@@ -37,36 +44,37 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from vanilla_transformer import config_C
 from vanilla_model import ToyVanilla
+import config as cfgmod
 from hessian_toy import (NeuronHessian, analyze_layer, default_layer_spec,
-                         spectra_to_prob, common_log_edges)
+                         spectra_to_prob, common_log_edges,
+                         cross_layer_matrices, hetero_mean)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
 
-# ---- config (CLI overridable via --key=value) ----
-dataset = "synth_zipf_imbalanced_s1_V1024"
-run_dir = os.path.join(HERE, "runs", "vanilla_imbalance_s1")   # where train_vanilla_transformer.py wrote ckpt_*.pt
-out_dir = os.path.join(HERE, "files", "vanilla_imbalance_s1")   # where to write eigs_*.npy, hetero_*.npy, and figures
-batch_size = 32
-n_batches = 20             # curvature batches per layer
-max_classes = 256          # per-class blocks for the V=1024 lm_head (subset for speed)
-max_tokens = 256           # per-token blocks for the V=1024 embedding (subset)
-num_bins = 64
-seed = 1337
+# ---- config: same preset selection + --group.key=value overrides as training.
+# Reading from the same ExperimentConfig means the checkpoint tags analysed here
+# (cfg.train.ckpt_fracs) always match the ones the trainer wrote -- no separate
+# TAGS list to keep in sync.
+cfg = cfgmod.apply_overrides(cfgmod.load(), sys.argv[1:])
 
-# checkpoint tags in training order, with the fraction of training they mark
-TAGS = [("init", 0.0), ("p10", 0.10), ("p50", 0.50), ("p100", 1.0)]
+model_cfg = cfg.to_model_config()
+dataset = cfg.data.dataset
+run_dir = os.path.join(HERE, "runs", cfg.train.run_name)     # where ckpt_*.pt live
+out_dir = os.path.join(HERE, "files", cfg.analyze.files_name)  # eigs/hetero npy + figures
+batch_size = cfg.analyze.batch_size
+n_batches = cfg.analyze.n_batches
+max_classes = cfg.analyze.max_classes
+max_tokens = cfg.analyze.max_tokens
+num_bins = cfg.analyze.num_bins
+seed = cfg.analyze.seed
 
-for arg in sys.argv[1:]:
-    assert arg.startswith("--") and "=" in arg, f"bad arg {arg}"
-    key, val = arg[2:].split("=", 1)
-    assert key in globals(), f"unknown key {key}"
-    cur = globals()[key]
-    globals()[key] = type(cur)(val)
+# checkpoint tags in training order, paired with the fraction they mark
+TAGS = sorted(cfg.train.ckpt_fracs.items(), key=lambda kv: kv[1])
 
-LAYER_SPEC = default_layer_spec(config_C.n_head, config_C.head_dim)
+LAYER_SPEC = default_layer_spec(model_cfg.n_head, model_cfg.head_dim,
+                                n_layer=model_cfg.n_layer)
 LAYER_NAMES = [d for (d, _, _) in LAYER_SPEC]
 
 
@@ -132,7 +140,7 @@ def plot_spectrum(save_dir, name, eigs, title):
     plt.close()
 
 
-def plot_heatmap(save_dir, name, D, metric, title):
+def plot_heatmap(save_dir, name, D, metric, title, labels=None):
     mask = np.triu(np.ones_like(D, dtype=bool), k=1)
     Dm = np.ma.array(D, mask=mask)
     vmax = float(np.sqrt(np.log(2.0))) if metric == "js" else None
@@ -142,13 +150,20 @@ def plot_heatmap(save_dir, name, D, metric, title):
     im = plt.imshow(Dm, cmap=cmap, vmin=0.0, vmax=vmax, aspect="equal")
     label = "Symmetric KL" if metric == "skl" else "JS distance"
     plt.colorbar(im, label=label, fraction=0.046, pad=0.04)
-    plt.title(title); plt.xlabel("unit index"); plt.ylabel("unit index")
+    plt.title(title)
+    if labels is not None:
+        ticks = np.arange(len(labels))
+        plt.xticks(ticks, labels, rotation=45, ha="right", fontsize=8)
+        plt.yticks(ticks, labels, fontsize=8)
+    else:
+        plt.xlabel("unit index"); plt.ylabel("unit index")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f"hetero_{name}_{metric}.png"), dpi=150)
     plt.close()
 
 
 def render_all_figs(all_results):
+    layer_means = {}   # tag -> {metric: lower-triangle mean of the cross-layer matrix}
     for tag, _ in TAGS:
         save_dir = os.path.join(out_dir, tag)
         if not os.path.isdir(save_dir):
@@ -163,6 +178,17 @@ def render_all_figs(all_results):
                 D = np.load(os.path.join(save_dir, f"hetero_{disp}_{metric}.npy"))
                 plot_heatmap(save_dir, disp, D, metric,
                              f"{disp} hetero ({metric.upper()}, {tag})")
+
+        # cross-LAYER hetero: one pooled spectrum per layer, pairwise distances
+        res = cross_layer_matrices(save_dir, LAYER_NAMES, num_bins=num_bins)
+        if res is not None:
+            layers, mats = res
+            layer_means[tag] = {}
+            for metric in ("skl", "js"):
+                plot_heatmap(save_dir, "layers", mats[metric], metric,
+                             f"cross-layer hetero ({metric.upper()}, {tag})",
+                             labels=layers)
+                layer_means[tag][metric] = hetero_mean(mats[metric])
 
     # evolution: one line per layer, x = training %
     for metric in ("skl", "js"):
@@ -186,6 +212,24 @@ def render_all_figs(all_results):
         plt.savefig(path, dpi=150); plt.close()
         print("wrote", path)
 
+    # evolution of the CROSS-LAYER hetero: mean pairwise distance between layers
+    for metric in ("skl", "js"):
+        xs = [frac * 100 for tag, frac in TAGS if tag in layer_means]
+        ys = [layer_means[tag][metric] for tag, _ in TAGS if tag in layer_means]
+        if not xs:
+            continue
+        plt.figure(figsize=(8, 5.5))
+        plt.plot(xs, ys, marker="o", color="darkslateblue")
+        plt.xlabel("training progress (% of iters)")
+        ylab = "mean Symmetric KL" if metric == "skl" else "mean JS distance"
+        plt.ylabel(ylab + " (lower-triangle, layer pairs)")
+        plt.title(f"Cross-layer Hessian heterogeneity vs training ({metric.upper()})")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(out_dir, f"evolution_layers_{metric}.png")
+        plt.savefig(path, dpi=150); plt.close()
+        print("wrote", path)
+
 
 def main():
     rank, world, device, is_ddp = setup_dist()
@@ -195,7 +239,7 @@ def main():
     if is_ddp:
         dist.barrier()
 
-    get_batch = make_get_batch(config_C.block_size, device)
+    get_batch = make_get_batch(model_cfg.block_size, device)
 
     # work items: (tag, layer). Shard strided across ranks.
     work = [(tag, item) for (tag, _) in TAGS for item in LAYER_SPEC]
@@ -208,7 +252,7 @@ def main():
         if tag not in model_cache:
             ckpt_path = os.path.join(run_dir, f"ckpt_{tag}.pt")
             ckpt = torch.load(ckpt_path, map_location=device)
-            m = ToyVanilla(config_C).to(device)
+            m = ToyVanilla(model_cfg).to(device)
             m.load_state_dict(ckpt["model"])
             model_cache[tag] = m
         return model_cache[tag]
@@ -223,7 +267,7 @@ def main():
         nh = NeuronHessian(model, get_batch, n_batches=n_batches, device=device)
         print(f"[rank {rank}] {tag}/{disp} ({kind}) ...", flush=True)
         analyze_layer(nh, out_dir, tag, disp, kind, kwargs,
-                      config_C.n_head, config_C.head_dim,
+                      model_cfg.n_head, model_cfg.head_dim,
                       max_classes=max_classes, max_tokens=max_tokens,
                       num_bins=num_bins, device=device)
 

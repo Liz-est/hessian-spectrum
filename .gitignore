@@ -147,7 +147,6 @@ checkpoint/
 files/
 
 # data
-/data_construction/data/
 /data
 
 # AI tools
@@ -161,3 +160,7 @@ install_claude.sh
 
 # sco
 sco-backup/
+
+# configs
+/data_construction/configs/
+/toy_models/config/

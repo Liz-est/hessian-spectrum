@@ -15,8 +15,11 @@ Outputs:
   2. Hessian spectrum (ESD)        -> files/vanilla_fineweb10B/<tag>/spectrum_<layer>.png
   3. per-token / last-layer hetero -> files/vanilla_fineweb10B/<tag>/hetero_<layer>_{skl,js}.png
   4. per-head / per-neuron hetero  -> files/vanilla_fineweb10B/<tag>/hetero_<layer>_{skl,js}.png
-  5. hetero-vs-epoch evolution     -> files/vanilla_fineweb10B/evolution_{skl,js}.png
+  5. cross-LAYER hetero heatmap    -> files/vanilla_fineweb10B/<tag>/hetero_layers_{skl,js}.png
+     (pairwise distance between the pooled spectra of all analyzed layers)
+  6. hetero-vs-epoch evolution     -> files/vanilla_fineweb10B/evolution_{skl,js}.png
      (init / 10% / 50% / 100% on the x-axis, one line per analyzed layer)
+  7. cross-layer hetero evolution  -> files/vanilla_fineweb10B/evolution_layers_{skl,js}.png
 
 Runs on CPU (single process) or on 8 GPUs (torchrun). Under torchrun the
 (checkpoint, layer) work items are sharded across ranks; every rank writes its
@@ -49,7 +52,8 @@ import matplotlib.pyplot as plt
 
 from vanilla_model import ToyVanilla, ToyVanillaConfig
 from hessian_toy import (NeuronHessian, analyze_layer, default_layer_spec,
-                         spectra_to_prob, common_log_edges)
+                         spectra_to_prob, common_log_edges,
+                         cross_layer_matrices, hetero_mean)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -175,7 +179,7 @@ def plot_spectrum(save_dir, name, eigs, title):
     plt.close()
 
 
-def plot_heatmap(save_dir, name, D, metric, title):
+def plot_heatmap(save_dir, name, D, metric, title, labels=None):
     mask = np.triu(np.ones_like(D, dtype=bool), k=1)
     Dm = np.ma.array(D, mask=mask)
     vmax = float(np.sqrt(np.log(2.0))) if metric == "js" else None
@@ -185,13 +189,20 @@ def plot_heatmap(save_dir, name, D, metric, title):
     im = plt.imshow(Dm, cmap=cmap, vmin=0.0, vmax=vmax, aspect="equal")
     label = "Symmetric KL" if metric == "skl" else "JS distance"
     plt.colorbar(im, label=label, fraction=0.046, pad=0.04)
-    plt.title(title); plt.xlabel("unit index"); plt.ylabel("unit index")
+    plt.title(title)
+    if labels is not None:
+        ticks = np.arange(len(labels))
+        plt.xticks(ticks, labels, rotation=45, ha="right", fontsize=8)
+        plt.yticks(ticks, labels, fontsize=8)
+    else:
+        plt.xlabel("unit index"); plt.ylabel("unit index")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f"hetero_{name}_{metric}.png"), dpi=150)
     plt.close()
 
 
 def render_all_figs(all_results):
+    layer_means = {}   # tag -> {metric: lower-triangle mean of the cross-layer matrix}
     for tag, _ in TAGS:
         save_dir = os.path.join(out_dir, tag)
         if not os.path.isdir(save_dir):
@@ -206,6 +217,17 @@ def render_all_figs(all_results):
                 D = np.load(os.path.join(save_dir, f"hetero_{disp}_{metric}.npy"))
                 plot_heatmap(save_dir, disp, D, metric,
                              f"{disp} hetero ({metric.upper()}, {tag})")
+
+        # cross-LAYER hetero: one pooled spectrum per layer, pairwise distances
+        res = cross_layer_matrices(save_dir, LAYER_NAMES, num_bins=num_bins)
+        if res is not None:
+            layers, mats = res
+            layer_means[tag] = {}
+            for metric in ("skl", "js"):
+                plot_heatmap(save_dir, "layers", mats[metric], metric,
+                             f"cross-layer hetero ({metric.upper()}, {tag})",
+                             labels=layers)
+                layer_means[tag][metric] = hetero_mean(mats[metric])
 
     # evolution: one line per layer, x = training %
     for metric in ("skl", "js"):
@@ -226,6 +248,24 @@ def render_all_figs(all_results):
         plt.grid(alpha=0.3); plt.legend(fontsize=8, ncol=2)
         plt.tight_layout()
         path = os.path.join(out_dir, f"evolution_{metric}.png")
+        plt.savefig(path, dpi=150); plt.close()
+        print("wrote", path)
+
+    # evolution of the CROSS-LAYER hetero: mean pairwise distance between layers
+    for metric in ("skl", "js"):
+        xs = [frac * 100 for tag, frac in TAGS if tag in layer_means]
+        ys = [layer_means[tag][metric] for tag, _ in TAGS if tag in layer_means]
+        if not xs:
+            continue
+        plt.figure(figsize=(8, 5.5))
+        plt.plot(xs, ys, marker="o", color="darkslateblue")
+        plt.xlabel("training progress (% of iters)")
+        ylab = "mean Symmetric KL" if metric == "skl" else "mean JS distance"
+        plt.ylabel(ylab + " (lower-triangle, layer pairs)")
+        plt.title(f"Cross-layer Hessian heterogeneity vs training ({metric.upper()})")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(out_dir, f"evolution_layers_{metric}.png")
         plt.savefig(path, dpi=150); plt.close()
         print("wrote", path)
 
