@@ -237,3 +237,38 @@ def sample_sequence(P, pi, length, rng):
             cur = V - 1
         out[t] = cur
     return out
+
+
+def sample_sequences_batch(P, pi, n_seqs, length, rng):
+    """Sample `n_seqs` independent length-`length` sequences in lock-step.
+
+    Statistically identical to calling `sample_sequence` n_seqs times: every
+    row starts from the stationary distribution pi and then follows P, and the
+    rows are mutually independent.  The difference is purely computational --
+    all rows advance together, one vectorised CDF lookup per time step, instead
+    of a Python-level loop per token.
+
+    The batched inverse-CDF lookup uses a row-offset trick: shifting row i of
+    the per-state CDF by +i makes the flattened (V*V,) table globally
+    non-decreasing (row i spans (i, i+1]), so a single np.searchsorted with
+    queries `cur + u` lands inside row `cur` at exactly the index the scalar
+    version would pick.
+
+    Returns
+    -------
+    out : np.ndarray, shape (n_seqs, length), dtype int64
+    """
+    V = pi.shape[0]
+    cdf = np.cumsum(P, axis=1)
+    cdf[:, -1] = 1.0                      # guard against fp drift
+    offset_cdf = (cdf + np.arange(V)[:, None]).ravel()
+
+    out = np.empty((n_seqs, length), dtype=np.int64)
+    cur = rng.choice(V, p=pi, size=n_seqs)
+    out[:, 0] = cur
+    u = rng.random((n_seqs, length))
+    for t in range(1, length):
+        g = np.searchsorted(offset_cdf, cur + u[:, t], side="right")
+        cur = np.minimum(g - cur * V, V - 1)   # numerical edge case
+        out[:, t] = cur
+    return out

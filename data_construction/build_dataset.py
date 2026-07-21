@@ -66,6 +66,8 @@ CONFIG = dict(
     seq_len=1024,                  # sequence length used only for sampling
                                    # continuity; the streams are flat afterwards
     order=1,                       # bigram; >1 reserved / not implemented yet
+    batch_chunks=4096,             # chunks sampled per batch; peak memory is
+                                   # ~24 bytes * batch_chunks * seq_len
     seed=1337,
     out_dir="data/synth_zipf",
 )
@@ -74,36 +76,25 @@ CONFIG = dict(
 # --------------------------------------------------------------------------- #
 # Target construction  (THE extension point for input-independent outputs)     #
 # --------------------------------------------------------------------------- #
-def build_targets(x, cfg):
-    """Produce the target stream y from the input stream x.
-
-    Default ("shift"): y[t] = x[t + shift]  -- i.e. standard next-token
-    prediction, numerically identical to the original single-stream format.
-
-    To later make outputs INDEPENDENT of the input (a different specified
-    distribution / mapping), add a new branch here, e.g.:
-
-        elif cfg["label_mode"] == "relabel":
-            # deterministic token->token remap drawn from a chosen distribution
-            y = label_map[x]
-        elif cfg["label_mode"] == "sample":
-            # sample y_t ~ p(y | x_t) from a separate output kernel
-            y = sample_from_output_kernel(x, output_kernel, rng)
-
-    Everything downstream (dual-stream .bin + meta) already supports this; only
-    this function decides how y relates to x.
-    """
-    mode = cfg["label_mode"]
-    if mode == "shift":
-        s = cfg["shift"]
-        # y is x shifted left by s; drop the last s tokens that have no target
-        y = x[s:]
-        x = x[:-s]
-        return x, y
-    raise NotImplementedError(
-        f"label_mode='{mode}' not implemented yet. Default is 'shift'. "
-        f"Add a branch in build_targets() to support input-independent outputs."
-    )
+# Default ("shift"): y[t] = x[t + shift] -- standard next-token prediction,
+# numerically identical to the original single-stream format.  The shift is
+# applied *while streaming* in write_stream below: the y file starts `shift`
+# tokens into the stream, and the x file holds back the last `shift` tokens,
+# so both files end up n_tokens - shift long without ever materialising the
+# full stream in memory.
+#
+# To later make outputs INDEPENDENT of the input (a different specified
+# distribution / mapping), add a per-batch branch in write_stream, e.g.:
+#
+#     elif cfg["label_mode"] == "relabel":
+#         # deterministic token->token remap drawn from a chosen distribution
+#         y_batch = label_map[x_batch]
+#     elif cfg["label_mode"] == "sample":
+#         # sample y_t ~ p(y | x_t) from a separate output kernel
+#         y_batch = sample_from_output_kernel(x_batch, output_kernel, rng)
+#
+# Pointwise modes like these stream trivially (no carry between batches).
+# Everything downstream (dual-stream .bin + meta) already supports this.
 
 
 # --------------------------------------------------------------------------- #
@@ -168,30 +159,11 @@ def build(cfg):
     print(f"[build] row entropy: mean={ent.mean():.3f} nats  "
           f"(max possible={np.log(V):.3f})")
 
-    # 3. sample the flat token streams  ------------------------------------ #
-    def make_stream(n_tokens, rng):
-        # sample in seq_len chunks (each chunk stationary) then concatenate
-        L = cfg["seq_len"]
-        n_chunks = int(np.ceil(n_tokens / L))
-        chunks = [T.sample_sequence(P, pi, L, rng) for _ in range(n_chunks)]
-        return np.concatenate(chunks)[:n_tokens]
-
-    print("[build] sampling train stream ...")
-    x_train = make_stream(cfg["n_train_tokens"], rng)
-    print("[build] sampling val stream ...")
-    x_val = make_stream(cfg["n_val_tokens"], rng)
-
-    # 4. build (x, y) dual streams per label_mode  ------------------------- #
-    xtr, ytr = build_targets(x_train, cfg)
-    xva, yva = build_targets(x_val, cfg)
-
-    # 5. write to disk  ---------------------------------------------------- #
+    # 3+4+5. sample, build (x, y), and write -- all streaming  ------------- #
     out_dir = cfg["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
-    for name, arr in [("train_x", xtr), ("train_y", ytr),
-                      ("val_x", xva), ("val_y", yva)]:
-        arr.astype(np.uint16).tofile(os.path.join(out_dir, f"{name}.bin"))
-        print(f"[write] {name}.bin  ({arr.size:,} tokens)")
+    n_tr = write_stream("train", cfg["n_train_tokens"], cfg, P, pi, rng, out_dir)
+    n_va = write_stream("val", cfg["n_val_tokens"], cfg, P, pi, rng, out_dir)
 
     meta = dict(
         vocab_size=V,
@@ -201,6 +173,8 @@ def build(cfg):
         row_entropy_mean=float(ent.mean()),
         label_mode=cfg["label_mode"],
         dual_stream=True,
+        n_train_tokens=n_tr,
+        n_val_tokens=n_va,
         config=cfg,
         seed=cfg["seed"],
     )
@@ -208,6 +182,59 @@ def build(cfg):
         pickle.dump(meta, f)
     print(f"[write] meta.pkl  -> {out_dir}")
     print("[done]")
+
+
+def write_stream(prefix, n_tokens, cfg, P, pi, rng, out_dir):
+    """Sample n_tokens and write <prefix>_x.bin / <prefix>_y.bin on the fly.
+
+    Chunks are sampled `batch_chunks` at a time with sample_sequences_batch,
+    flattened, and appended straight to disk as uint16, so peak memory is
+    O(batch_chunks * seq_len) regardless of n_tokens.
+
+    label_mode "shift" is applied at the stream level, identical to the old
+    materialise-then-slice code: y = stream[shift:], x = stream[:-shift].
+    Across batches that means the y file skips the first `shift` tokens of the
+    stream and the x file holds back a `shift`-token carry until the end.
+    """
+    if cfg["label_mode"] != "shift":
+        raise NotImplementedError(
+            f"label_mode='{cfg['label_mode']}' not implemented yet. Default is "
+            f"'shift'. Add a per-batch branch in write_stream() to support "
+            f"input-independent outputs."
+        )
+    s = cfg["shift"]
+    L = cfg["seq_len"]
+    n_chunks = int(np.ceil(n_tokens / L))
+    batch = max(1, int(cfg["batch_chunks"]))
+
+    path_x = os.path.join(out_dir, f"{prefix}_x.bin")
+    path_y = os.path.join(out_dir, f"{prefix}_y.bin")
+    remaining = n_tokens
+    seen = 0                                   # tokens emitted so far
+    carry = np.empty(0, dtype=np.uint16)       # tail held back from x
+    with open(path_x, "wb") as fx, open(path_y, "wb") as fy:
+        for start in range(0, n_chunks, batch):
+            b = min(batch, n_chunks - start)
+            seg = T.sample_sequences_batch(P, pi, b, L, rng).ravel()
+            seg = seg[:remaining].astype(np.uint16)
+            remaining -= seg.size
+
+            # y = stream[s:]  -> skip the first s tokens of the whole stream
+            skip = max(0, s - seen)
+            seg[skip:].tofile(fy)
+
+            # x = stream[:-s] -> always hold back the latest s tokens
+            buf = np.concatenate([carry, seg])
+            buf[:max(0, buf.size - s)].tofile(fx)
+            carry = buf[buf.size - min(s, buf.size):]
+
+            seen += seg.size
+            print(f"[write] {prefix}: {seen:,} / {n_tokens:,} tokens sampled",
+                  flush=True)
+
+    n_written = max(0, n_tokens - s)
+    print(f"[write] {prefix}_x.bin / {prefix}_y.bin  ({n_written:,} tokens each)")
+    return n_written
 
 
 if __name__ == "__main__":
