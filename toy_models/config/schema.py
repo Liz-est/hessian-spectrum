@@ -35,6 +35,7 @@ class ModelConfig:
     head_dim: int = 32         # d_head (n_head * head_dim == n_embd here)
     n_ffn: int = 1024          # FFN inner size d_ff
     n_layer: int = 1           # single-layer decoder
+    block_type: str = "transformer"  # "transformer" (attn+FFN) | "mlp" (FFN+FFN)
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
@@ -48,6 +49,13 @@ class DataConfig:
     # dataset directory name under <repo-root>/data/
     dataset: str = "synth_uniform_balanced_V1024"
     batch_size: int = 64       # per-GPU batch; effective batch = batch_size * world_size
+    # data on-disk layout / batching:
+    #   "dual_stream"    -> train_x.bin + train_y.bin, x and y stored separately
+    #                       (the synth bigram data; targets read straight from y).
+    #   "nanogpt_shards" -> fineweb_{train,val}_*.bin modded-nanoGPT shards: a
+    #                       single uint16 token stream per shard behind a 1024-byte
+    #                       header; targets are the inputs shifted by one.
+    format: str = "dual_stream"
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +151,6 @@ class ExperimentConfig:
         return ToyVanillaConfig(
             vocab_size=m.vocab_size, n_embd=m.n_embd, n_head=m.n_head,
             head_dim=m.head_dim, n_ffn=m.n_ffn, n_layer=m.n_layer,
-            block_size=m.block_size, dropout=m.dropout,
+            block_type=m.block_type, block_size=m.block_size, dropout=m.dropout,
             attn_dropout=m.attn_dropout,
         )

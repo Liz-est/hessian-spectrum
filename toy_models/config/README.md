@@ -23,9 +23,28 @@ checkpoint 计划、模型结构不会漂移。
 |---|---|---|---|
 | `imbalance_s1_sgd`(默认) | 单层 vanilla,n_layer=1 | SGD | `vanilla_imbalance_s1-sgd` |
 | `imbalance_s1_adamw` | 单层 vanilla,n_layer=1 | AdamW | `vanilla_imbalance_s1-adamw` |
-| `simpliest_sgd` | 仅 embed+lm_head,n_layer=0 | SGD | `simpliest_imbalance_s1-sgd` |
+| `simpliest_sgd-{imbalance,balance}` | 仅 embed+lm_head,n_layer=0 | SGD | `simpliest_*-sgd` |
+| `simpliest_adamw-{imbalance,balance}` | 仅 embed+lm_head,n_layer=0 | AdamW | `simpliest_*-adamw` |
+| `simpliest_{imbalance,balance}_1B_sgd` | 仅 embed+lm_head,1B 数据 | SGD | `simpliest_*_1B-sgd` |
+| `layer5-{imbalance-s1,balance}-{sgd,adamw}` | 5 层 vanilla,n_layer=5 | SGD/AdamW | `layer5-*` |
+| `layer5-{imbalance-s1,balance}-1B-adamw` | 5 层 vanilla,1B 数据 | AdamW | `layer5-*-1B-adamw` |
+| `mlp10_{sgd,adamw}-{imbalance,balance}` | 10 FFN(无 attention），n_layer=5+block_type=mlp | SGD/AdamW | `mlp10_*` |
+| `fineweb10B-adamw` | 5 层 vanilla，真实语料 FineWeb-10B（GPT-2 BPE，vocab 50304，block_size 1024） | AdamW | `fineweb10B-adamw` |
 
-`vanilla` 脚本对默认 `imbalance_s1_sgd`,`simpliest` 脚本对默认 `simpliest_sgd`。
+`mlp10_*` 是把 5 层 vanilla 里每个 block 的 attention 子层换成 FFN（`block_type="mlp"`）
+得到的纯 MLP 模型：10 个 FFN 子层 + embed + lm_head，没有 attention。走 vanilla 那条
+train/analyze 链，Hessian 里 attn 槽按逐神经元（neuron）分块。
+
+`fineweb10B-adamw` 是唯一的**真实数据**预设：数据在 `<repo-root>/data/fineweb10B/`，是
+modded-nanoGPT 的单流 shard 格式（每个 `fineweb_*.bin` 有 1024 字节 header + uint16 token
+流，target = 输入右移一位），因此 `DataConfig.format="nanogpt_shards"`；synth 双流数据
+（`train_x.bin`/`train_y.bin`）用默认的 `format="dual_stream"`。train/analyze 脚本按此字段
+选数据加载器，模型、优化器、Hessian 机器完全复用。训练预算沿用原
+`train_vanilla_transformer_fineweb10B.py`（20k iters，bs=32，warmup=400，lr 6e-4→6e-5）。
+
+`vanilla` 脚本默认 `imbalance_s1_sgd`,`simpliest` 脚本默认 `simpliest_sgd-imbalance`
+(见 `train_simpliest_model.py` / `analyze_simpliest.py` 顶部的 `load(...)`,改预设 key
+时记得同步这两处硬编码名)。
 
 ## 本地运行
 
@@ -37,7 +56,7 @@ cd toy_models
 python train_vanilla_transformer.py                          # 默认预设 imbalance_s1_sgd
 python train_vanilla_transformer.py imbalance_s1_adamw       # 换成另一个预设
 python train_vanilla_transformer.py --optim.name=adamw --lr.learning_rate=3e-4
-python train_simpliest_model.py                              # 默认预设 simpliest_sgd
+python train_simpliest_model.py                              # 默认预设 simpliest_sgd-imbalance
 python analyze_simpliest.py --analyze.max_classes=1024       # 全词表 lm_head/embedding
 torchrun --standalone --nproc_per_node=8 train_vanilla_transformer.py   # 8 卡 DDP
 ```
@@ -47,7 +66,7 @@ torchrun --standalone --nproc_per_node=8 train_vanilla_transformer.py   # 8 卡 
 两个提交脚本各自绑定一套模型和它的 train/analyze 脚本:
 
 * `submit_sco_vanilla.py`   → `train_vanilla_transformer.py` + `analyze_vanilla.py`(默认 `imbalance_s1_sgd`)
-* `submit_sco_simpliest.py` → `train_simpliest_model.py` + `analyze_simpliest.py`(默认 `simpliest_sgd`)
+* `submit_sco_simpliest.py` → `train_simpliest_model.py` + `analyze_simpliest.py`(默认 `simpliest_sgd-imbalance`)
 
 ```bash
 cd /data/250010020/hessian-spectrum
@@ -96,9 +115,12 @@ AdamW 版的 simpliest:
 
 ## 各字段含义(改哪调哪,见 `config/schema.py`)
 
-* **模型结构** `ModelConfig`:`n_layer`(0=仅 embed+head,1=单层)、`n_embd`、`n_head`、
+* **模型结构** `ModelConfig`:`n_layer`(0=仅 embed+head,1=单层,5=五层)、
+  `block_type`(`transformer`=attn+FFN,`mlp`=FFN+FFN 无 attention)、`n_embd`、`n_head`、
   `head_dim`、`n_ffn`、`vocab_size`、`block_size`
-* **数据/batch** `DataConfig`:`dataset`、`batch_size`(每卡;有效 batch = ×world_size)
+* **数据/batch** `DataConfig`：`dataset`、`batch_size`（每卡；有效 batch = ×world_size）、
+  `format`（`dual_stream` = synth 双流 `train_x.bin`/`train_y.bin`，默认；`nanogpt_shards` =
+  FineWeb 单流 shard，header 后连续 token，target 右移一位）
 * **优化器 + 超参** `OptimConfig`:`name`(sgd/adamw/adam)、`momentum`、`nesterov`(SGD)、
   `betas`、`eps`(Adam(W))、`weight_decay`、`grad_clip`(0 关闭裁剪)
 * **学习率/调度** `LRConfig`:`scheduler`(cosine/constant)、`learning_rate`(峰值)、

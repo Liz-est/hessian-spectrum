@@ -49,7 +49,7 @@ REPO_ROOT = os.path.dirname(HERE)
 # A bare CLI token still selects a different preset; --group.key=value overrides
 # individual fields.
 # ----------------------------------------------------------------------------
-cfg = cfgmod.apply_overrides(cfgmod.load("simpliest_sgd"), sys.argv[1:])
+cfg = cfgmod.apply_overrides(cfgmod.load("simpliest_sgd-imbalance"), sys.argv[1:])
 
 model_cfg = cfg.to_model_config()
 dataset = cfg.data.dataset
@@ -149,7 +149,9 @@ def main():
         print(f"  saved checkpoint {path} (iter {it})")
 
     log_path = os.path.join(out_dir, "loss_log.csv")
+    val_log_path = os.path.join(out_dir, "val_loss_log.csv")
     log_rows = []
+    val_rows = []
 
     model.train()
     t0 = time.time()
@@ -163,6 +165,7 @@ def main():
 
         if it % eval_interval == 0 and is_master:
             vloss = eval_val()
+            val_rows.append((it, vloss))
             print(f"iter {it}: val loss {vloss:.4f}  (lr {get_lr(it):.2e}, {time.time()-t0:.1f}s)")
 
         if it == max_iters:
@@ -188,13 +191,23 @@ def main():
             w.writerows(log_rows)
         print("wrote", log_path)
 
+        with open(val_log_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["iter", "val_loss"])
+            w.writerows(val_rows)
+        print("wrote", val_log_path)
+
         if log_rows:
             its = [r[0] for r in log_rows]
             ls = [r[1] for r in log_rows]
             plt.figure(figsize=(7, 4.5))
-            plt.plot(its, ls, lw=1.2)
-            plt.xlabel("iteration"); plt.ylabel("train loss (cross-entropy)")
-            plt.title("vanilla_transformer training loss")
+            plt.plot(its, ls, lw=1.2, label="train")
+            if val_rows:
+                plt.plot([r[0] for r in val_rows], [r[1] for r in val_rows],
+                         lw=1.2, marker="o", ms=3, label="val")
+            plt.xlabel("iteration"); plt.ylabel("loss (cross-entropy)")
+            plt.title(f"{cfg.train.run_name} loss")
+            plt.legend()
             plt.grid(alpha=0.3); plt.tight_layout()
             fig_path = os.path.join(out_dir, "loss_curve.png")
             plt.savefig(fig_path, dpi=150); plt.close()

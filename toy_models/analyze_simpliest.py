@@ -59,7 +59,7 @@ REPO_ROOT = os.path.dirname(HERE)
 # analysis matches train_simpliest_model.py. Reading the same ExperimentConfig
 # means the checkpoint tags analysed here (cfg.train.ckpt_fracs) and the model
 # shape (n_layer=0) always match what the trainer wrote.
-cfg = cfgmod.apply_overrides(cfgmod.load("simpliest_sgd"), sys.argv[1:])
+cfg = cfgmod.apply_overrides(cfgmod.load("simpliest_sgd-imbalance"), sys.argv[1:])
 
 model_cfg = cfg.to_model_config()
 dataset = cfg.data.dataset

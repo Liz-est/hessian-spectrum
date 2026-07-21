@@ -333,13 +333,19 @@ class NeuronHessian:
 # ----------------------------------------------------------------------------
 # layer spec: display name -> how to block it
 # ----------------------------------------------------------------------------
-def default_layer_spec(n_head, head_dim, n_layer=1):
+def default_layer_spec(n_head, head_dim, n_layer=1, block_type="transformer"):
     """Return an ordered list of (display_name, kind, kwargs) analysis items.
 
-    embedding and lm_head always exist. The per-block attention / MLP layers
-    are only emitted for models that actually have transformer blocks
-    (n_layer >= 1); with n_layer == 0 (embed + lm_head only) they are omitted,
-    so the analyzer never tries to load or plot layers that don't exist.
+    embedding and lm_head always exist. The per-block sub-layers are only
+    emitted for models that actually have transformer blocks (n_layer >= 1);
+    with n_layer == 0 (embed + lm_head only) they are omitted, so the analyzer
+    never tries to load or plot layers that don't exist.
+
+    block_type selects how each block's FIRST sub-layer is blocked:
+      * "transformer": attention -> Q/K per head, V/proj per neuron.
+      * "mlp": the attention slot is a second FFN (see vanilla_model.Block), so
+        it is blocked per output neuron like any Linear. The submodule attribute
+        is still `attn`, hence the blocks.<i>.attn.c_fc / .c_proj paths below.
     """
     spec = [("embedding", "token", {"path": "tok_emb"})]
     for li in range(n_layer):
@@ -348,14 +354,22 @@ def default_layer_spec(n_head, head_dim, n_layer=1):
         # display names keep the block index only when there is more than one
         # block, so the single-block case reads exactly as before.
         pre = "" if n_layer == 1 else f"b{li}_"
-        spec += [
-            (f"{pre}attn_wq",   "head",   {"path": f"{p}.wq"}),
-            (f"{pre}attn_wk",   "head",   {"path": f"{p}.wk"}),
-            (f"{pre}attn_wv",   "neuron", {"path": f"{p}.wv"}),
-            (f"{pre}attn_proj", "neuron", {"path": f"{p}.wo"}),
-            (f"{pre}mlp_fc",    "neuron", {"path": f"{m}.c_fc"}),
-            (f"{pre}mlp_proj",  "neuron", {"path": f"{m}.c_proj"}),
-        ]
+        if block_type == "mlp":
+            spec += [
+                (f"{pre}ffn1_fc",   "neuron", {"path": f"{p}.c_fc"}),
+                (f"{pre}ffn1_proj", "neuron", {"path": f"{p}.c_proj"}),
+                (f"{pre}ffn2_fc",   "neuron", {"path": f"{m}.c_fc"}),
+                (f"{pre}ffn2_proj", "neuron", {"path": f"{m}.c_proj"}),
+            ]
+        else:
+            spec += [
+                (f"{pre}attn_wq",   "head",   {"path": f"{p}.wq"}),
+                (f"{pre}attn_wk",   "head",   {"path": f"{p}.wk"}),
+                (f"{pre}attn_wv",   "neuron", {"path": f"{p}.wv"}),
+                (f"{pre}attn_proj", "neuron", {"path": f"{p}.wo"}),
+                (f"{pre}mlp_fc",    "neuron", {"path": f"{m}.c_fc"}),
+                (f"{pre}mlp_proj",  "neuron", {"path": f"{m}.c_proj"}),
+            ]
     spec.append(("lm_head", "class", {"path": "lm_head"}))
     return spec
 

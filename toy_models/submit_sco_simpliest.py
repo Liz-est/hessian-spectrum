@@ -50,7 +50,7 @@ STORAGE_MOUNT = "01995892-d478-76d8-aec7-13fd8284477e:/data"
 USER_DATA = "/data/" + "250010020"   # this dev box's /data/250010020 == shared storage /data/<user-id>
 REPO_ROOT = f"{USER_DATA}/hessian-spectrum"
 WORK_DIR = f"{REPO_ROOT}/toy_models"
-JOB_NAME = "simpliest-hessian"    # change per run, keep unique
+JOB_NAME = "simpliest-hessian-adamw"    # change per run, keep unique
 
 # nanogpt env python by absolute path (no conda activation needed).
 CONDA_ENV_PATH = f"{USER_DATA}/miniconda3/envs/nanogpt"
@@ -63,7 +63,7 @@ NPROC_PER_NODE = 8
 # phases resolve the same run_name and checkpoint schedule.
 #   e.g. EXP_ARGS = "imbalance_s1_adamw"
 #        EXP_ARGS = "--optim.name=adamw --lr.learning_rate=3e-4"
-EXP_ARGS = "simpliest_adamw"       # applied to BOTH phases
+EXP_ARGS = "simpliest_sgd-balance"       # applied to BOTH phases
 TRAIN_ARGS = EXP_ARGS       # e.g. EXP_ARGS + " --train.max_iters=8000"
 # full-vocab lm_head/embedding analysis: add " --analyze.max_classes=1024 --analyze.max_tokens=1024"
 ANALYZE_ARGS = EXP_ARGS

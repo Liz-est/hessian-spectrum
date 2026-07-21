@@ -61,11 +61,11 @@ NPROC_PER_NODE = 8
 # phases resolve the same run_name and checkpoint schedule.
 #   e.g. EXP_ARGS = "imbalance_s1_adamw"
 #        EXP_ARGS = "--optim.name=adamw --lr.learning_rate=3e-4"
-EXP_ARGS = ""       # applied to BOTH phases
+EXP_ARGS = "layer5-fineweb10B-sgd"       # applied to BOTH phases
 TRAIN_ARGS = EXP_ARGS       # e.g. EXP_ARGS + " --train.max_iters=8000"
 # full-vocab lm_head/embedding analysis: add " --analyze.max_classes=1024 --analyze.max_tokens=1024"
 ANALYZE_ARGS = EXP_ARGS
-
+    
 TRAIN_LAUNCH = (
     f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
     f"--nproc_per_node={NPROC_PER_NODE} train_vanilla_transformer.py {TRAIN_ARGS}"
