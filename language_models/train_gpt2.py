@@ -140,9 +140,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 
 # poor man's data loader
-# NOTE: this copy lives in language_models/test_data/, one level deeper than the
-# original, so the relative path to the dataset gains an extra '..'.
-data_dir = os.path.join('..','..','data_construction','data', dataset)
+# NOTE: run from language_models/; the dataset lives at
+# <repo-root>/data_construction/data/, i.e. one level up.
+data_dir = os.path.join('..','data_construction','data', dataset)
 
 # Two supported on-disk formats:
 #   (A) legacy single-stream: train.bin / val.bin, target = input shifted by 1
@@ -315,21 +315,25 @@ X, Y = get_batch('train') # fetch the very first batch
 
 
 def plot_hessian():
-    # Hessian spectrum estimation is single-process: run it on rank 0 only,
-    # on the raw (unwrapped) model; other ranks wait at the barrier.
+    # All ranks participate: the HVP batches inside each Lanczos step are
+    # sharded across ranks and all-reduced (see hessian_spectrum.py), so the
+    # Lanczos recursion runs in lockstep on every rank. Plot/file IO is
+    # rank-0 only. Uses the raw (unwrapped) model so no DDP grad sync fires
+    # during the double-backward.
+    raw_model = model.module if ddp else model
+
+    batch_size = 8
+    gradient_accumulation_steps = 60
+    use_minibatch = True
+
+    hessian = hessian_spectrum.Hessian(raw_model, ckpt_iteration = load_iter, train_data = train_data, train_target = (train_y if dual_stream else None), batch_size= batch_size, block_size= block_size,  ctx = ctx, use_minibatch = use_minibatch, gradient_accumulation_steps = gradient_accumulation_steps, device = device, sample_layer = sample_layer, ddp = ddp, comment = comment)
+
+    hessian.get_spectrum(layer_by_layer = True)
     if master_process:
-        raw_model = model.module if ddp else model
-
-        batch_size = 8
-        gradient_accumulation_steps = 60
-        use_minibatch = True
-
-        hessian = hessian_spectrum.Hessian(raw_model, ckpt_iteration = load_iter, train_data = train_data, train_target = (train_y if dual_stream else None), batch_size= batch_size, block_size= block_size,  ctx = ctx, use_minibatch = use_minibatch, gradient_accumulation_steps = gradient_accumulation_steps, device = device, sample_layer = sample_layer, comment = comment)
-
-        hessian.get_spectrum(layer_by_layer = True)
         hessian.load_curve(layer_by_layer = True)
 
-        hessian.get_spectrum(layer_by_layer = False)
+    hessian.get_spectrum(layer_by_layer = False)
+    if master_process:
         hessian.load_curve(layer_by_layer = False)
 
     if ddp:

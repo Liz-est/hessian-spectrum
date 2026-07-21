@@ -8,8 +8,8 @@ Edit the marked sections below, then run (from the hessian-spectrum repo):
 
 Notes
 -----
-* The job first creates the `gpt2` conda env from environment.yml if it does
-  not exist yet (idempotent), then activates it and launches training.
+* The job uses the existing `nanogpt` env from the shared /data storage by
+  invoking its python directly (no conda activation, no env creation).
 * Dataset: train_gpt2.py reads ../../data_construction/data/<dataset> relative
   to the working directory (language_models/). Make sure the dataset is built
   BEFORE submitting -- the job does not build it.
@@ -39,12 +39,21 @@ WORKER_SPEC = "n6ls.iu.i40.8.32c512g"   # 8x H100
 STORAGE_MOUNT = "01995892-d478-76d8-aec7-13fd8284477e:/data"
 
 # ===== EDIT THESE FOR YOUR EXPERIMENT ==================================
-REPO_ROOT = "/data/250010020/hessian-spectrum"
+# NOTE: the job container only mounts /data. This dev machine's /data/250010020 is
+# actually the shared storage's /data/250010020 directory, so everything
+# (repo, conda env, dataset) is referenced via its /data path, which is
+# valid both here and inside the container.
+USER_DATA = "/data/" + "250010020"   # this dev box's /data/250010020 == /data/<user-id> on shared storage
+REPO_ROOT = f"{USER_DATA}/hessian-spectrum"
 WORK_DIR = f"{REPO_ROOT}/language_models"
-JOB_NAME = "zlx-gpt2-hessian-001"        # change per run, keep unique
+JOB_NAME = "gpt2-hessian-002"        # change per run, keep unique
 
-CONDA_SH = "/data/250010020/miniconda3/etc/profile.d/conda.sh"
-CONDA_ENV = "gpt2"                       # created from environment.yml on first run
+# No conda activation: miniconda3/ on shared storage is a bare cloned-envs
+# tree (no etc/profile.d/conda.sh), and anaconda3/'s conda.sh hardcodes
+# /mnt/afs/250010020 paths that don't exist inside the container. The env
+# has no activate.d hooks, so invoking its python directly is equivalent.
+CONDA_ENV_PATH = f"{USER_DATA}/miniconda3/envs/nanogpt"
+ENV_PYTHON = f"{CONDA_ENV_PATH}/bin/python"
 
 # 8-GPU single-node DDP. gradient_accumulation_steps in the config (40)
 # must stay divisible by NPROC_PER_NODE (asserted in train_gpt2.py).
@@ -53,19 +62,17 @@ NPROC_PER_NODE = 8
 TRAIN_ARGS = "config/train_gpt2_small.py --dataset=synth_uniform_balanced"
 
 LAUNCH = (
-    f"torchrun --standalone --nproc_per_node={NPROC_PER_NODE} "
-    f"train_gpt2.py {TRAIN_ARGS}"
+    f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
+    f"--nproc_per_node={NPROC_PER_NODE} train_gpt2.py {TRAIN_ARGS}"
 )
 
-# The command that runs inside the container: activate (creating if needed)
-# the gpt2 conda env, then launch training from language_models/ so that the
-# relative paths (configurator.py, config/, ../../data_construction) resolve.
+# The command that runs inside the container: run the nanogpt env's python
+# by absolute path (PATH prepended so torchrun-spawned workers resolve the
+# same interpreter), then launch training from language_models/ so the
+# relative paths (configurator.py, config/, ../data_construction) resolve.
 COMMAND = (
     f"cd {WORK_DIR} && "
-    f"source {CONDA_SH} && "
-    f"(conda env list | grep -qw {CONDA_ENV} || "
-    f"conda env create -n {CONDA_ENV} -f environment.yml) && "
-    f"conda activate {CONDA_ENV} && "
+    f"export PATH={CONDA_ENV_PATH}/bin:$PATH && "
     f"{LAUNCH}"
 )
 # =======================================================================

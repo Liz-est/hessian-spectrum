@@ -4,6 +4,7 @@ import torch
 import time
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 import os
 import matplotlib.pyplot as plt
 from contextlib import nullcontext
@@ -30,27 +31,46 @@ class Hessian(object):
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.device = device
         self.sample_layer = sample_layer
+        # ddp=True: every rank runs the Lanczos iteration in lockstep and the
+        # per-step HVP batches are sharded across ranks + all-reduced, so each
+        # rank holds identical (summed) Hd tensors and the recursion stays in
+        # sync without further communication. Files are written by rank 0 only.
         self.ddp = ddp
+        if self.ddp:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+        self.is_master = self.rank == 0
         self.num_v = num_v
         self.num_bins = 1000
 
 
- 
+
         total_elements = len(self.train_data)
         self.num_batches = total_elements // (self.batch_size * self.block_size)
-        
-        print('total batch', self.num_batches)
+
+        if self.is_master:
+            print('total batch', self.num_batches)
 
         self.total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         #n_params = sum(p.numel() for p in self.parameters())
-        print('total params', self.total_params)
-   
+        if self.is_master:
+            print('total params', self.total_params)
+
 
         self.comment = comment + '_minibatch_'+str(self.use_minibatch) +'_bs_'+str(self.batch_size*(self.gradient_accumulation_steps))+ '_m_'+str(self.m)  + '_v_' +str(self.num_v) + '_ckpt_'+str(self.ckpt_iteration)
 
         self.file_dir = 'files/'+str(self.comment)+'/'
 
-        os.makedirs(self.file_dir, exist_ok= True)
+        if self.is_master:
+            os.makedirs(self.file_dir, exist_ok= True)
+
+    def _hvp_batch_indices(self):
+        'indices of the HVP batches THIS rank computes (strided shard)'
+        n = min(self.num_batches, self.gradient_accumulation_steps) if self.use_minibatch else self.num_batches
+        return range(self.rank, n, self.world_size), n
 
 
     def get_spectrum(self, layer_by_layer = False):
@@ -75,12 +95,13 @@ class Hessian(object):
 
     
         t_s = time.time()
-        for k in range(self.num_v): 
-            print('current k' , k)
+        for k in range(self.num_v):
+            if self.is_master:
+                print('current k' , k)
 
             'wiki version'
             T_dic = self.tridiagonalize_by_lanzcos_layer_by_layer(k) #returns a dic: {'name': T}
-            
+
             for name, T in T_dic.items():
                 eigenvalues, U  = np.linalg.eigh(T)
                 values_dic[name][k] = eigenvalues.tolist() #array to list
@@ -88,13 +109,15 @@ class Hessian(object):
 
 
             'we also save the inter-medium results'
-            self.save_curve(total_time= time.time() - t_s, weights_layer = weights_dic, values_layer = values_dic)
+            if self.is_master:
+                self.save_curve(total_time= time.time() - t_s, weights_layer = weights_dic, values_layer = values_dic)
 
 
 
         total_time = time.time() - t_s
 
-        self.save_curve(total_time= total_time, weights_layer = weights_dic, values_layer = values_dic)
+        if self.is_master:
+            self.save_curve(total_time= total_time, weights_layer = weights_dic, values_layer = values_dic)
 
 
 
@@ -104,20 +127,21 @@ class Hessian(object):
         values = np.zeros((self.num_v, self.m))
         time_initial = time.time()
 
-        for k in range(self.num_v): 
+        for k in range(self.num_v):
             'wiki version'
             T = self.tridiagonalize_by_lanzcos(k)
             eigenvalues, U  = np.linalg.eigh(T)
             values[k,:] = eigenvalues
             weights[k,:] = U[0]**2
-   
 
-            self.save_curve(total_time = time.time() -time_initial, weights_full =  {'weights': weights}, values_full = {'values': values}, grid = [], curve = [])
-            
+
+            if self.is_master:
+                self.save_curve(total_time = time.time() -time_initial, weights_full =  {'weights': weights}, values_full = {'values': values}, grid = [], curve = [])
+
         total_time = time.time() -time_initial
-        grid, curve = self.interpolate(weights, values)
-
-        self.save_curve(total_time = total_time, weights_full =  {'weights': weights}, values_full = {'values': values}, grid = grid, curve = curve)
+        if self.is_master:
+            grid, curve = self.interpolate(weights, values)
+            self.save_curve(total_time = total_time, weights_full =  {'weights': weights}, values_full = {'values': values}, grid = grid, curve = curve)
 
     def save_curve(self,total_time = None, weights_layer = None, values_layer = None, weights_full = None, values_full = None, grid = [], curve = []):
 
@@ -273,6 +297,10 @@ class Hessian(object):
                 continue
             if params.requires_grad:
                 v = torch.randn_like(params, dtype = torch.float32)
+                if self.ddp:
+                    # ranks have different seeds: all must start from rank 0's
+                    # direction or the recursions diverge
+                    dist.broadcast(v, src = 0)
                 v /= torch.norm(v)
                 v_dic[name] = [v]
                 T_dic[name] = np.zeros((self.m, self.m), dtype= np.float64)
@@ -287,7 +315,8 @@ class Hessian(object):
             T_dic[name][0, 0] = alpha_dic[name].item()
 
         'iteration'
-        print('runing lanczos')
+        if self.is_master:
+            print('runing lanczos')
         for j in range(1, self.m):
 
             for name in T_dic.keys():
@@ -305,7 +334,8 @@ class Hessian(object):
             t_hessian = time.time()
 
             w_prime_dic = self.hessian_vector_product_with_dic_input(v_dic, k,j)
-            print('t for hessian', time.time() - t_hessian)
+            if self.is_master:
+                print('t for hessian', time.time() - t_hessian)
 
             'orthogonalize wprime'
             for name in T_dic.keys():
@@ -328,6 +358,10 @@ class Hessian(object):
 
         'initialization'
         v = torch.randn(self.total_params, dtype = torch.float32, device = self.device)
+        if self.ddp:
+            # ranks have different seeds: all must start from rank 0's
+            # direction or the recursions diverge
+            dist.broadcast(v, src = 0)
         v /= torch.norm(v)
         v_list.append(v)
 
@@ -340,7 +374,8 @@ class Hessian(object):
 
         'iteration'
         #t_s = time.time()
-        print('runing lanczos')
+        if self.is_master:
+            print('runing lanczos')
         for j in range(1, self.m):
             beta = torch.norm(w)
             # 1e-6 threshold: fp32 machine epsilon is ~1.2e-7, values below
@@ -400,7 +435,12 @@ class Hessian(object):
 
 
         t_hd = time.time()
-        for batch_idx in range(self.num_batches):
+        # shard the HVP batches across ranks; each rank computes a strided
+        # subset and the partial sums are all-reduced below, so every rank
+        # ends up with the identical full-batch Hd (bitwise, since NCCL
+        # reduction order is fixed) and the Lanczos recursions stay in sync.
+        my_batches, n_total = self._hvp_batch_indices()
+        for i, batch_idx in enumerate(my_batches):
 
 
             X, Y = self.get_batch(batch_idx)
@@ -426,13 +466,14 @@ class Hessian(object):
                     hd_dic[name]  += param.grad.data
                     self.model.zero_grad(set_to_none = True)
 
-            if batch_idx % 10 == 1 or batch_idx == self.gradient_accumulation_steps-1:
-                print(f'layer hessian: load_iter ={self.ckpt_iteration}, current random direction = {v_step} / {self.num_v}, lanczos step = {l_step} / {self.m}, Hd current batch = {batch_idx} / {self.num_batches}, time = {time.time() -t_hd}')
+            if self.is_master and (i % 10 == 1 or i == len(my_batches)-1):
+                print(f'layer hessian: load_iter ={self.ckpt_iteration}, current random direction = {v_step} / {self.num_v}, lanczos step = {l_step} / {self.m}, Hd current batch (this rank) = {i} / {len(my_batches)} (total {n_total} over {self.world_size} ranks), time = {time.time() -t_hd}')
                 t_hd = time.time()
 
-            if self.use_minibatch == True and batch_idx == self.gradient_accumulation_steps-1:
-                break
-       
+        if self.ddp:
+            for name in hd_dic.keys():
+                dist.all_reduce(hd_dic[name], op = dist.ReduceOp.SUM)
+
         return hd_dic
 
     def hessian_vector_product_with_tensor_input(self, d_tensor, v_step, l_step):
@@ -445,7 +486,9 @@ class Hessian(object):
         total_hd_tensor = torch.zeros(self.total_params, dtype = torch.float32, device = self.device)
 
         t_hd = time.time()
-        for batch_idx in range(self.num_batches):
+        # shard the HVP batches across ranks (see dic-input variant above)
+        my_batches, n_total = self._hvp_batch_indices()
+        for i, batch_idx in enumerate(my_batches):
 
             X, Y = self.get_batch(batch_idx)
             with self.ctx:
@@ -472,12 +515,12 @@ class Hessian(object):
             self.model.zero_grad(set_to_none = True)
             total_hd_tensor += hd_tensor
 
-            if batch_idx % 10 == 1 or batch_idx == self.gradient_accumulation_steps-1:
-                print(f'full hessian: load_iter ={self.ckpt_iteration} current random direction = {v_step} / {self.num_v}, lanczos step = {l_step} / {self.m}, Hd current batch = {batch_idx} / {self.num_batches}, time = {time.time() -t_hd}')
+            if self.is_master and (i % 10 == 1 or i == len(my_batches)-1):
+                print(f'full hessian: load_iter ={self.ckpt_iteration} current random direction = {v_step} / {self.num_v}, lanczos step = {l_step} / {self.m}, Hd current batch (this rank) = {i} / {len(my_batches)} (total {n_total} over {self.world_size} ranks), time = {time.time() -t_hd}')
                 t_hd = time.time()
 
-            if self.use_minibatch == True and batch_idx == self.gradient_accumulation_steps-1:
-                break
+        if self.ddp:
+            dist.all_reduce(total_hd_tensor, op = dist.ReduceOp.SUM)
         return total_hd_tensor
 
     def get_batch(self, batch_idx):

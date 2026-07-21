@@ -10,7 +10,6 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
-import algorithms
 
 import torch
 import torch.nn as nn
@@ -140,6 +139,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     flash_attn: bool = False
     device: str= 'cuda'
+    tie_weights: bool = True # tie wte and lm_head. False: independent last layer (for Hessian study)
 
 class GPT(nn.Module):
 
@@ -162,7 +162,8 @@ class GPT(nn.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if config.tie_weights:
+            self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
