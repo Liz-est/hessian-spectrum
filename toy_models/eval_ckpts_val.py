@@ -21,7 +21,8 @@ sinusoidal pos_enc in forward, while train_vanilla_transformer.py's model
 (vanilla_model.py) does. The state dicts are indistinguishable (pos_enc is a
 non-persistent buffer), so the model class is chosen by the experiment name
 recorded in the checkpoint ("simpliest*" -> simpliest_model, else
-vanilla_model). Runs without <data>/val_x.bin (e.g. fineweb10B) are skipped.
+vanilla_model). Datasets with dual-stream val_x/val_y.bin and nanogpt-shard
+val files (fineweb10B) are both supported.
 """
 
 import csv
@@ -49,6 +50,16 @@ RUNS_DIR = os.path.join(HERE, "runs")
 EVAL_ITERS = 50
 BATCH_SIZE = 64
 SEED = 1337
+
+# Runs from before the config/preset system: their checkpoints carry no
+# "experiment" dict, so the dataset is mapped by hand here. Verified against
+# the old hard-coded trainer (commit fd8f8fa) and the ckpt vocab_size (1024
+# matches only the V1024 datasets). fineweb10B still gets skipped (no val_x.bin).
+FALLBACK_DATASET = {
+    "vanilla_balance_adamw": "synth_uniform_balanced_V1024",
+    "vanilla_imbalance_s1": "synth_zipf_imbalanced_s1_V1024",
+    "vanilla_fineweb10B": "fineweb10B",
+}
 
 
 def eval_ckpt(ckpt_path, val_x, val_y, device, run):
@@ -87,14 +98,27 @@ def process_run(run):
     ck0 = torch.load(os.path.join(run_dir, ckpts[0]), map_location="cpu", weights_only=False)
     dataset = (ck0.get("experiment") or {}).get("data", {}).get("dataset")
     if dataset is None:
+        dataset = FALLBACK_DATASET.get(run)
+    if dataset is None:
         print(f"[{run}] no dataset recorded in checkpoint, skipping")
         return
     data_dir = os.path.join(REPO_ROOT, "data", dataset)
-    if not os.path.exists(os.path.join(data_dir, "val_x.bin")):
-        print(f"[{run}] {dataset} has no val_x.bin, skipping")
-        return
-    val_x = np.memmap(os.path.join(data_dir, "val_x.bin"), dtype=np.uint16, mode="r")
-    val_y = np.memmap(os.path.join(data_dir, "val_y.bin"), dtype=np.uint16, mode="r")
+    if os.path.exists(os.path.join(data_dir, "val_x.bin")):
+        val_x = np.memmap(os.path.join(data_dir, "val_x.bin"), dtype=np.uint16, mode="r")
+        val_y = np.memmap(os.path.join(data_dir, "val_y.bin"), dtype=np.uint16, mode="r")
+    else:
+        # nanogpt_shards val (fineweb): single uint16 stream after a 256-int32
+        # header; targets are the stream shifted by one.
+        import glob
+        paths = sorted(glob.glob(os.path.join(data_dir, "*_val_*.bin")))
+        if not paths:
+            print(f"[{run}] {dataset} has no val_x.bin or val shards, skipping")
+            return
+        header = np.fromfile(paths[0], dtype=np.int32, count=256)
+        assert header[0] == 20240520, f"bad magic in {paths[0]}: {header[0]}"
+        ntok = int(header[2])
+        toks = np.memmap(paths[0], dtype=np.uint16, mode="r", offset=256 * 4)[:ntok]
+        val_x, val_y = toks[:-1], toks[1:]
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     rows = []
