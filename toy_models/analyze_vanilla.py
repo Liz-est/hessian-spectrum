@@ -33,6 +33,7 @@ same way as the trainer, e.g.:
 import os
 import sys
 import json
+from datetime import timedelta
 
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 
@@ -86,7 +87,10 @@ LAYER_NAMES = [d for (d, _, _) in LAYER_SPEC]
 def setup_dist():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
+        # Ranks get uneven shares of the layer work (layer20: 122 items/tag) and
+        # the fast ones wait at the final barrier; the NCCL default 10 min
+        # watchdog SIGABRTs the whole group. Give it room.
+        dist.init_process_group(backend=backend, timeout=timedelta(hours=4))
         rank = dist.get_rank()
         world = dist.get_world_size()
         if torch.cuda.is_available():
@@ -290,6 +294,11 @@ def main():
         if not os.path.exists(ckpt_path):
             if is_master:
                 print(f"[skip] checkpoint missing: {ckpt_path}")
+            continue
+        # summary_*.json is written last in analyze_layer, so it marks the item
+        # as done — lets a re-run resume after a crash/timeout without redoing work.
+        if os.path.exists(os.path.join(out_dir, tag, f"summary_{disp}.json")):
+            print(f"[rank {rank}] {tag}/{disp} already done, skipping", flush=True)
             continue
         model = get_model(tag)
         nh = NeuronHessian(model, get_batch, n_batches=n_batches, device=device)
