@@ -72,6 +72,25 @@ max_tokens = cfg.analyze.max_tokens
 num_bins = cfg.analyze.num_bins
 seed = cfg.analyze.seed
 
+# token_select="freq": analyze the top-N most frequent token ids (by corpus
+# unigram count) instead of ids 0..N-1. On fineweb (GPT-2 BPE) ids 0-255 are
+# raw bytes -- rare and partly unseen in the analysis batches -- so plain
+# truncation measures the wrong tokens; the synth data keeps "first" (its ids
+# are already frequency-sorted).
+if cfg.analyze.token_select == "freq":
+    counts_path = os.path.join(REPO_ROOT, "data", cfg.data.dataset, "token_counts.npy")
+    if not os.path.exists(counts_path):
+        raise FileNotFoundError(
+            f"{counts_path} not found; build it with compute_fineweb_token_freq.py "
+            f"before running a token_select='freq' analysis.")
+    _top = np.argsort(-np.load(counts_path), kind="stable")
+    CLASS_IDS = _top[:max_classes].copy()
+    TOKEN_IDS = _top[:max_tokens].copy()
+elif cfg.analyze.token_select == "first":
+    CLASS_IDS = TOKEN_IDS = None
+else:
+    raise ValueError(f"unknown analyze.token_select: {cfg.analyze.token_select!r}")
+
 # checkpoint tags in training order, paired with the fraction they mark
 TAGS = sorted(cfg.train.ckpt_fracs.items(), key=lambda kv: kv[1])
 
@@ -268,6 +287,9 @@ def main():
     is_master = rank == 0
     if is_master:
         os.makedirs(out_dir, exist_ok=True)
+        if TOKEN_IDS is not None:
+            np.save(os.path.join(out_dir, f"token_ids_top{len(TOKEN_IDS)}.npy"),
+                    TOKEN_IDS)
     if is_ddp:
         dist.barrier()
 
@@ -306,7 +328,9 @@ def main():
         analyze_layer(nh, out_dir, tag, disp, kind, kwargs,
                       model_cfg.n_head, model_cfg.head_dim,
                       max_classes=max_classes, max_tokens=max_tokens,
-                      num_bins=num_bins, device=device)
+                      num_bins=num_bins, device=device,
+                      class_ids=CLASS_IDS, token_ids=TOKEN_IDS,
+                      loss_type=model_cfg.loss_type)
 
     if is_ddp:
         dist.barrier()
