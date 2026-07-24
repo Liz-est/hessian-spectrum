@@ -272,3 +272,124 @@ def sample_sequences_batch(P, pi, n_seqs, length, rng):
         cur = np.minimum(g - cur * V, V - 1)   # numerical edge case
         out[:, t] = cur
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 7. Output coupling K(y | x): DIFFERENT marginals pi_x, pi_y, yet DEPENDENT   #
+# --------------------------------------------------------------------------- #
+def sinkhorn_coupling(pi_x, pi_y, A, n_iter=2000, tol=1e-12):
+    """Scale a positive affinity A into a joint M with prescribed marginals.
+
+    Solves for diagonal scalings u, v so that  M = diag(u) A diag(v)  lands in
+    the transportation polytope U(pi_x, pi_y):
+
+        M >= 0,   M @ 1 = pi_x   (row sums = input marginal),
+                  M.T @ 1 = pi_y (col sums = output marginal).
+
+    For any strictly positive A the Sinkhorn/RAS iteration converges to the
+    unique such M (it is the I-projection of A onto U, i.e. the min-KL coupling
+    with those marginals).  M keeps the *structure* of A (e.g. a near-diagonal
+    bump => x tends to map to y of a nearby index) while matching both margins
+    exactly -- this is what makes x and y dependent yet with the marginals we
+    asked for.
+
+    Returns
+    -------
+    M : np.ndarray, shape (V, V), rows sum to pi_x, cols sum to pi_y.
+    """
+    pi_x = np.asarray(pi_x, dtype=np.float64)
+    pi_y = np.asarray(pi_y, dtype=np.float64)
+    A = np.asarray(A, dtype=np.float64).copy()
+    A /= A.sum()                                  # normalise for stability
+    V = pi_x.shape[0]
+    u = np.ones(V)
+    v = np.ones(V)
+    for _ in range(n_iter):
+        # row scaling: (u A v).sum(axis=1) == pi_x
+        Av = A @ v
+        u = pi_x / np.maximum(Av, 1e-300)
+        # col scaling: (u A v).sum(axis=0) == pi_y
+        uA = A.T @ u
+        v_new = pi_y / np.maximum(uA, 1e-300)
+        if np.max(np.abs(v_new - v)) < tol:
+            v = v_new
+            break
+        v = v_new
+    M = (u[:, None] * A) * v[None, :]
+    M /= M.sum()                                  # kill residual fp drift
+    return M
+
+
+def build_coupling_kernel(pi_x, pi_y, strength=1.0, bandwidth_frac=0.02,
+                          rng=None):
+    """Conditional kernel K(y | x) with col-marginal exactly pi_y for any strength.
+
+    We want y | x drawn so that (a) the achieved output marginal is exactly
+    pi_y = sum_i pi_x[i] K[i, :], and (b) a knob `strength` in [0, 1] moves from
+    INDEPENDENT (y ignores x) to a STRUCTURED dependence.  Both are secured by a
+    convex combination that mirrors build_transition:
+
+        K = (1 - b) * (1 pi_y^T)  +  b * R,    b = strength,
+        with R a row-stochastic kernel whose col-marginal under pi_x is pi_y:
+        R[i, j] = M[i, j] / pi_x[i],   M = sinkhorn_coupling(pi_x, pi_y, A).
+
+    Because pi_x^T (1 pi_y^T) = pi_y and pi_x^T R = (1^T M) = pi_y, we get
+    pi_x^T K = (1 - b) pi_y + b pi_y = pi_y for EVERY b -- the output marginal is
+    held fixed while b tunes how much y depends on x.
+
+        b = 0  -> K rows all equal pi_y  -> y independent of x (== 'independent'
+                  mode, but with x/y still allowed different marginals).
+        b = 1  -> K = R, the structured (near-diagonal) coupling: given x = i,
+                  y concentrates on output tokens with nearby index.
+
+    The affinity A is the same circular-Gaussian bump used for the input kernel
+    (bandwidth_frac controls sharpness), so "structure" here means x maps to y of
+    a similar index -- a clean, reproducible, low-entropy dependence.
+
+    Returns
+    -------
+    K : np.ndarray, shape (V, V), row-stochastic (K @ 1 == 1),
+        with pi_x^T K == pi_y.
+    """
+    assert 0.0 <= strength <= 1.0, "coupling strength must be in [0, 1]"
+    pi_x = np.asarray(pi_x, dtype=np.float64)
+    pi_y = np.asarray(pi_y, dtype=np.float64)
+    V = pi_x.shape[0]
+
+    A = make_proposal(V, bandwidth_frac, rng)          # positive bump affinity
+    M = sinkhorn_coupling(pi_x, pi_y, A)               # joint with both margins
+    R = M / np.maximum(pi_x[:, None], 1e-300)          # condition: R = p(y | x)
+    R /= R.sum(axis=1, keepdims=True)                  # clean fp drift
+
+    indep = np.broadcast_to(pi_y, (V, V))              # rows all equal pi_y
+    K = (1.0 - strength) * indep + strength * R
+    K = np.clip(K, 0.0, None)
+    K /= K.sum(axis=1, keepdims=True)
+    return K
+
+
+def output_marginal(pi_x, K):
+    """Achieved output marginal  pi_y_hat = pi_x^T K  (for diagnostics)."""
+    return np.asarray(pi_x, dtype=np.float64) @ np.asarray(K, dtype=np.float64)
+
+
+def sample_y_given_x(K, x_flat, rng):
+    """Sample y_t ~ K(x_t, :) for a flat array of input tokens x_flat.
+
+    Vectorised inverse-CDF with the same row-offset trick as
+    sample_sequences_batch: peak memory is O(len(x_flat) + V*V) rather than
+    materialising a (len(x_flat), V) probability table.
+
+    Returns
+    -------
+    y : np.ndarray, same shape as x_flat, dtype int64.
+    """
+    V = K.shape[0]
+    cdf = np.cumsum(K, axis=1)
+    cdf[:, -1] = 1.0
+    offset_cdf = (cdf + np.arange(V)[:, None]).ravel()
+    x = np.asarray(x_flat, dtype=np.int64)
+    u = rng.random(x.shape)
+    g = np.searchsorted(offset_cdf, x + u, side="right")
+    y = np.minimum(g - x * V, V - 1)
+    return y
