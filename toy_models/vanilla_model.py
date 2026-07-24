@@ -35,6 +35,7 @@ class ToyVanillaConfig:
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
+    loss_type: str = "ce"      # "ce" (softmax cross-entropy) | "mse" (vs one-hot)
     device: str = "cpu"
 
 
@@ -163,8 +164,17 @@ class ToyVanilla(nn.Module):
             x = block(x)
         if targets is not None:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.view(-1), ignore_index=-1)
+            if self.config.loss_type == "mse":
+                flat = logits.view(-1, logits.size(-1))
+                tgt = targets.view(-1)
+                mask = tgt != -1                       # drop ignore_index=-1
+                flat = flat[mask]
+                tgt = tgt[mask]
+                onehot = F.one_hot(tgt, num_classes=flat.size(-1)).to(flat.dtype)
+                loss = F.mse_loss(flat, onehot)
+            else:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                       targets.view(-1), ignore_index=-1)
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None

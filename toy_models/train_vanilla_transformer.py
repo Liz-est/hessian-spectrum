@@ -246,7 +246,8 @@ def main():
             if val_rows:
                 plt.plot([r[0] for r in val_rows], [r[1] for r in val_rows],
                          lw=1.2, marker="o", ms=3, label="val")
-            plt.xlabel("iteration"); plt.ylabel("loss (cross-entropy)")
+            loss_label = "MSE (vs one-hot)" if cfg.model.loss_type == "mse" else "cross-entropy"
+            plt.xlabel("iteration"); plt.ylabel(f"loss ({loss_label})")
             plt.title(f"{cfg.train.run_name} loss")
             plt.legend()
             plt.grid(alpha=0.3); plt.tight_layout()
