@@ -29,6 +29,13 @@ Per token, lm_head (CE, exact):  output neuron k == vocab token k,
   s_{k,t} = p_{k,t}(1-p_{k,t}) is the exact CE curvature (matches the vision
   code's ce_last_layer_hessian_blocks).
 
+Per token, lm_head (MSE-vs-one-hot, exact):  loss = mean over N*C of
+(z-y)^2, so d^2 L / d z_k^2 = 2/C is constant and class-decoupled, giving
+    H_k = (2/C) * (1/N) sum_t x_t x_t^T                  (d x d)
+  the SAME block for every class k -- MSE removes the class-frequency-driven
+  curvature heterogeneity that CE's p_k(1-p_k) weight introduces. C is the full
+  vocab size (every class contributes to the mean, even un-selected ones).
+
 Per token, embedding (Fisher):  token id v owns embedding row e_v in R^d,
     H_v = (1/N_v) sum_{t: x_t=v} g_t g_t^T             (d x d)
   g_t = dL/d(embedding output at position t); accumulated over the positions
@@ -183,13 +190,49 @@ class NeuronHessian:
         return m
 
     # ---- lm_head: exact CE block per token (== per output class) ----
-    def last_layer_blocks(self, head_path="lm_head", max_classes=None):
+    def last_layer_blocks(self, head_path="lm_head", max_classes=None,
+                          class_ids=None, loss_type="ce"):
+        """class_ids: explicit class ids to build blocks for (row order follows
+        class_ids). When None, the first min(C, max_classes) ids are used.
+
+        loss_type: "ce" -> exact softmax cross-entropy curvature
+        p_k(1-p_k) x x^T (class-dependent). "mse" -> MSE-vs-one-hot curvature
+        (2/C_full) x x^T, identical for every class (C_full = full vocab)."""
         head = self._module(head_path)
         d = head.in_features
-        C = head.out_features
-        if max_classes is not None:
-            C = min(C, max_classes)
-        Hsum = torch.zeros((C, d, d), dtype=torch.float64, device=self.device)
+        C_full = head.out_features
+        C = C_full
+        if class_ids is not None:
+            ks = [int(k) for k in class_ids]
+        else:
+            if max_classes is not None:
+                C = min(C, max_classes)
+            ks = list(range(C))
+
+        # MSE: every class shares one block H = (2/C_full) * mean_t x x^T, so we
+        # accumulate the feature Gram once and skip the per-class softmax loop.
+        if loss_type == "mse":
+            Gram = torch.zeros((d, d), dtype=torch.float64, device=self.device)
+            n_tok = 0
+            captured = {}
+            def hook(mod, inp, out):
+                captured["x"] = inp[0].detach()
+            h = head.register_forward_hook(hook)
+            self.model.eval()
+            with torch.no_grad():
+                for _ in range(self.n_batches):
+                    X, Y = self.get_batch()
+                    self.model(X, Y)
+                    feat = captured["x"].reshape(-1, d).to(torch.float64)     # (N,d)
+                    Gram += feat.t() @ feat
+                    n_tok += feat.shape[0]
+            h.remove()
+            block = (2.0 / C_full) * (Gram / max(1, n_tok))
+            block_eigs = torch.linalg.eigvalsh(block).cpu().numpy()           # (d,)
+            # identical spectrum for every selected class
+            return np.tile(block_eigs, (len(ks), 1)).copy()
+
+        Hsum = torch.zeros((len(ks), d, d), dtype=torch.float64, device=self.device)
         n_tok = 0
 
         captured = {}
@@ -203,25 +246,37 @@ class NeuronHessian:
                 logits, _ = self.model(X, Y)
                 feat = captured["x"].reshape(-1, d).to(torch.float64)         # (N,d)
                 probs = F.softmax(logits.reshape(-1, logits.size(-1)), dim=-1)
-                for k in range(C):
+                for slot, k in enumerate(ks):
                     pk = probs[:, k].to(torch.float64)
                     w = pk * (1.0 - pk)                                       # (N,)
-                    Hsum[k] += feat.t() @ (w.unsqueeze(1) * feat)
+                    Hsum[slot] += feat.t() @ (w.unsqueeze(1) * feat)
                 n_tok += feat.shape[0]
         h.remove()
         Hsum /= max(1, n_tok)                                             # in place
-        eigs = np.stack([torch.linalg.eigvalsh(Hsum[k]).cpu().numpy() for k in range(C)])
+        eigs = np.stack([torch.linalg.eigvalsh(Hsum[s]).cpu().numpy()
+                         for s in range(len(ks))])
         return eigs
 
     # ---- embedding: Fisher block per token id ----
-    def token_embedding_blocks(self, emb_path="tok_emb", max_tokens=None):
+    def token_embedding_blocks(self, emb_path="tok_emb", max_tokens=None,
+                               token_ids=None):
+        """token_ids: explicit token ids to build blocks for (row order follows
+        token_ids). When None, the first min(V, max_tokens) ids are used."""
         emb = self._module(emb_path)
-        V = emb.num_embeddings
+        V_full = emb.num_embeddings
         d = emb.embedding_dim
-        if max_tokens is not None:
-            V = min(V, max_tokens)
-        Hsum = torch.zeros((V, d, d), dtype=torch.float64, device=self.device)
-        cnt = torch.zeros(V, dtype=torch.float64, device=self.device)
+        if token_ids is not None:
+            sel = torch.as_tensor(np.asarray(token_ids), dtype=torch.long,
+                                  device=self.device)
+        else:
+            V = V_full if max_tokens is None else min(V_full, max_tokens)
+            sel = torch.arange(V, device=self.device)
+        n_sel = sel.numel()
+        # token id -> block slot (-1 = not selected)
+        lut = torch.full((V_full,), -1, dtype=torch.long, device=self.device)
+        lut[sel] = torch.arange(n_sel, device=self.device)
+        Hsum = torch.zeros((n_sel, d, d), dtype=torch.float64, device=self.device)
+        cnt = torch.zeros(n_sel, dtype=torch.float64, device=self.device)
 
         store = {}
         def fhook(mod, inp, out):
@@ -237,17 +292,18 @@ class NeuronHessian:
             loss.backward()
             ids = store["ids"].reshape(-1)                                # (N,)
             g = store["out"].grad.reshape(-1, d).to(torch.float64)       # (N,d)
-            mask = ids < V
-            ids = ids[mask]; g = g[mask]
-            # accumulate g g^T into the block of each token id (index_add)
+            slot = lut[ids]
+            mask = slot >= 0
+            slot = slot[mask]; g = g[mask]
+            # accumulate g g^T into the block of each selected token (index_add)
             outer = torch.einsum("ni,nj->nij", g, g)                     # (N,d,d)
-            Hsum.index_add_(0, ids, outer)
-            cnt.index_add_(0, ids, torch.ones_like(ids, dtype=torch.float64))
+            Hsum.index_add_(0, slot, outer)
+            cnt.index_add_(0, slot, torch.ones_like(slot, dtype=torch.float64))
         h.remove()
         self.model.zero_grad(set_to_none=True)
-        denom = cnt.clamp_min(1.0).view(V, 1, 1)
+        denom = cnt.clamp_min(1.0).view(n_sel, 1, 1)
         Hsum /= denom
-        eigs = np.stack([torch.linalg.eigvalsh(Hsum[v]).cpu().numpy() for v in range(V)])
+        eigs = np.stack([torch.linalg.eigvalsh(Hsum[v]).cpu().numpy() for v in range(n_sel)])
         return eigs, cnt.cpu().numpy()
 
     # ---- hidden Linear: Fisher block per output neuron ----
@@ -375,14 +431,23 @@ def default_layer_spec(n_head, head_dim, n_layer=1, block_type="transformer"):
 
 
 def compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
-                       max_classes=256, max_tokens=256):
+                       max_classes=256, max_tokens=256,
+                       class_ids=None, token_ids=None, loss_type="ce"):
     """Dispatch to the right blocking routine, return (eigs, meta)."""
     if kind == "class":
-        eigs = nh.last_layer_blocks(kwargs["path"], max_classes=max_classes)
-        return eigs, {"unit": "token(class)"}
+        eigs = nh.last_layer_blocks(kwargs["path"], max_classes=max_classes,
+                                    class_ids=class_ids, loss_type=loss_type)
+        meta = {"unit": "token(class)", "loss_type": loss_type}
+        if class_ids is not None:
+            meta["token_select"] = "freq"
+        return eigs, meta
     if kind == "token":
-        eigs, cnt = nh.token_embedding_blocks(kwargs["path"], max_tokens=max_tokens)
-        return eigs, {"unit": "token", "n_seen": int((cnt > 0).sum())}
+        eigs, cnt = nh.token_embedding_blocks(kwargs["path"], max_tokens=max_tokens,
+                                              token_ids=token_ids)
+        meta = {"unit": "token", "n_seen": int((cnt > 0).sum())}
+        if token_ids is not None:
+            meta["token_select"] = "freq"
+        return eigs, meta
     if kind == "head":
         eigs = nh.head_blocks(kwargs["path"], n_head, head_dim)
         return eigs, {"unit": "head"}
@@ -396,12 +461,15 @@ def compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
 # top-level: analyze one layer of one checkpoint, save eigs + hetero matrices
 # ----------------------------------------------------------------------------
 def analyze_layer(nh, out_dir, tag, disp, kind, kwargs, n_head, head_dim,
-                  max_classes=256, max_tokens=256, num_bins=64, device="cpu"):
+                  max_classes=256, max_tokens=256, num_bins=64, device="cpu",
+                  class_ids=None, token_ids=None, loss_type="ce"):
     save_dir = os.path.join(out_dir, tag)
     os.makedirs(save_dir, exist_ok=True)
 
     eigs, meta = compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
-                                    max_classes=max_classes, max_tokens=max_tokens)
+                                    max_classes=max_classes, max_tokens=max_tokens,
+                                    class_ids=class_ids, token_ids=token_ids,
+                                    loss_type=loss_type)
     np.save(os.path.join(save_dir, f"eigs_{disp}.npy"), eigs)
 
     edges = common_log_edges(eigs, num_bins)
