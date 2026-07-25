@@ -163,3 +163,6 @@ sco-backup/
 
 # configs
 /data_construction/configs/
+
+# try
+/toy_models/new_metric/

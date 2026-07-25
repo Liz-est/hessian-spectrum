@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Submit one SCO job that runs the vanilla_transformer (vanilla decoder) experiment on
-8 GPUs: first DDP training, then the 8-GPU-sharded exact per-unit Hessian
-analysis, all in a single job.
+8 GPUs: DDP training, then the 8-GPU-sharded exact per-unit Hessian analysis,
+and -- if the resolved config has analyze.slq=True -- the full-parameter Hessian
+SLQ pass (analyze_full_spectrum.py), all in a single job.
 
 Usage (from the hessian-spectrum repo):
     python3 submit_sco_vanilla.py            # asks for confirmation
@@ -14,12 +15,16 @@ Notes
 * The container only mounts /data, so the repo, conda env, and dataset are all
   referenced by their /data paths (valid both on this dev box and in the job).
 * All experiment settings come from the config package (toy_models/config/).
-  Pick a preset / override fields via TRAIN_ARGS and ANALYZE_ARGS below; the
-  SAME tokens must go to both phases so they agree on run_name / ckpt schedule.
+  Pick a preset / override fields via EXP_ARGS below; the SAME tokens go to
+  every phase so they agree on run_name / files_name / ckpt schedule.
 * Phase 1 (train_vanilla_transformer.py) launches 8-GPU DDP via torchrun and writes one
   checkpoint per tag in the preset's ckpt_fracs under toy_models/runs/<run_name>/.
 * Phase 2 (analyze_vanilla.py) launches 8-GPU torchrun; the (checkpoint x layer) work
   items are sharded across the 8 ranks. Rank 0 renders all figures at the end.
+* Phase 3 (analyze_full_spectrum.py, only when analyze.slq is on -- set it in
+  the preset or pass --analyze.slq=true in EXP_ARGS): full-parameter Hessian
+  ESD via SLQ; (checkpoint x probe) Lanczos runs sharded across the 8 ranks,
+  output under files/<files_name>/slq/.
 * The dataset named by the preset (cfg.data.dataset) must already be built
   under data/ -- the job does not build it.
 """
@@ -27,6 +32,8 @@ Notes
 import argparse
 import subprocess
 import sys
+
+import config as cfgmod
 
 # ---- SCO binary + profile (do not use the bare `sco` on PATH) ----
 SCO = "/root/.sco/bin/sco"
@@ -57,31 +64,30 @@ ENV_PYTHON = f"{CONDA_ENV_PATH}/bin/python"
 NPROC_PER_NODE = 8
 
 # Config selection + overrides. A bare token picks a preset (config/presets.py);
-# --group.key=value overrides one field. Keep TRAIN/ANALYZE in sync so both
-# phases resolve the same run_name and checkpoint schedule.
+# --group.key=value overrides one field. The SAME tokens are applied to every
+# phase so they all resolve the same run_name / files_name / ckpt schedule.
 #   e.g. EXP_ARGS = "imbalance_s1_adamw"
-#        EXP_ARGS = "--optim.name=adamw --lr.learning_rate=3e-4"
-EXP_ARGS = "layer5-fineweb10B-sgd"       # applied to BOTH phases
-TRAIN_ARGS = EXP_ARGS       # e.g. EXP_ARGS + " --train.max_iters=8000"
-# full-vocab lm_head/embedding analysis: add " --analyze.max_classes=1024 --analyze.max_tokens=1024"
-ANALYZE_ARGS = EXP_ARGS
-    
-TRAIN_LAUNCH = (
-    f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
-    f"--nproc_per_node={NPROC_PER_NODE} train_vanilla_transformer.py {TRAIN_ARGS}"
-)
-ANALYZE_LAUNCH = (
-    f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
-    f"--nproc_per_node={NPROC_PER_NODE} analyze_vanilla.py {ANALYZE_ARGS}"
-)
+#        EXP_ARGS = "imbalance_s1_adamw --analyze.slq=true"
+EXP_ARGS = "mlp10_adamw-balance"       # applied to ALL phases
+
+# resolve the config locally to read the analyze.slq switch (and echo paths);
+# the job re-resolves the same tokens on the cluster.
+_cfg = cfgmod.apply_overrides(cfgmod.load(EXP_ARGS.split()[0]), EXP_ARGS.split()[1:])
+
+def _launch(script):
+    return (f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
+            f"--nproc_per_node={NPROC_PER_NODE} {script} {EXP_ARGS}")
 
 # run inside the container: cd into toy_models/, put the env python on PATH so
-# torchrun-spawned workers resolve the same interpreter, then train then analyze.
+# torchrun-spawned workers resolve the same interpreter, then run the phases.
+PHASES = ["train_vanilla_transformer.py", "analyze_vanilla.py"]
+if _cfg.analyze.slq:
+    PHASES.append("analyze_full_spectrum.py")
+
 COMMAND = (
     f"cd {WORK_DIR} && "
     f"export PATH={CONDA_ENV_PATH}/bin:$PATH && "
-    f"{TRAIN_LAUNCH} && "
-    f"{ANALYZE_LAUNCH}"
+    + " && ".join(_launch(s) for s in PHASES)
 )
 # =======================================================================
 
@@ -125,8 +131,12 @@ def main() -> None:
     print(f"Job name:   {JOB_NAME}")
     print(f"Worker spec:{WORKER_SPEC}")
     print(f"Work dir:   {WORK_DIR}")
+    print(f"Config:     {EXP_ARGS}")
+    print(f"Run dir:    runs/{_cfg.train.run_name}")
+    print(f"Files dir:  files/{_cfg.analyze.files_name}")
     print(f"DDP:        torchrun, {NPROC_PER_NODE} GPUs x {WORKER_NODES} node(s)")
-    print("Phases:     (1) DDP train  ->  (2) 8-GPU-sharded Hessian analysis")
+    slq = "  ->  (3) full-parameter SLQ" if _cfg.analyze.slq else ""
+    print(f"Phases:     (1) DDP train  ->  (2) per-unit Hessian analysis{slq}")
     if not args.yes:
         if input("Continue? (y/n): ").strip().lower() != "y":
             print("Cancelled.")

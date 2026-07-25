@@ -39,6 +39,11 @@ class ModelConfig:
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
+    # training objective:
+    #   "ce"  -> softmax cross-entropy on integer targets (the default)
+    #   "mse" -> mean-squared error between logits and the one-hot target
+    #            vector (ignore_index=-1 positions are still dropped)
+    loss_type: str = "ce"
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +120,26 @@ class AnalyzeConfig:
     n_batches: int = 20           # curvature batches accumulated per layer
     max_classes: int = 256        # per-token lm_head blocks to compute (<= vocab_size)
     max_tokens: int = 256         # per-token embedding blocks to compute (<= vocab_size)
+    # how the analyzed token ids are picked for embedding / lm_head blocks:
+    #   "first" -> ids 0..max-1 (fine for the synth data, whose ids are already
+    #              sorted by descending frequency)
+    #   "freq"  -> the max most frequent ids by corpus unigram count, read from
+    #              data/<dataset>/token_counts.npy (build it with
+    #              compute_fineweb_token_freq.py)
+    token_select: str = "first"
     num_bins: int = 64            # log-eigenvalue histogram bins
     seed: int = 1337
     # sub-directory name under toy_models/files/ for eigs/hetero npy + figures
     files_name: str = "vanilla_imbalance_s1-sgd"
+    # ---- full-parameter SLQ (analyze_full_spectrum.py) ----
+    # if True, submit_sco_vanilla.py appends the SLQ phase to the job, so one
+    # submission runs train -> per-unit Hessian -> full-parameter SLQ.
+    slq: bool = False
+    slq_m: int = 100              # Lanczos steps per probe vector
+    slq_num_v: int = 16           # random probe vectors per checkpoint
+    slq_n_batches: int = 64       # fixed batches the HVP averages over
+    slq_sigma2: float = 1e-5      # gaussian broadening variance for the density
+    slq_dtype: str = "fp64"       # HVP/Lanczos precision: "fp64" | "fp32"
 
 
 # ---------------------------------------------------------------------------
@@ -152,5 +173,5 @@ class ExperimentConfig:
             vocab_size=m.vocab_size, n_embd=m.n_embd, n_head=m.n_head,
             head_dim=m.head_dim, n_ffn=m.n_ffn, n_layer=m.n_layer,
             block_type=m.block_type, block_size=m.block_size, dropout=m.dropout,
-            attn_dropout=m.attn_dropout,
+            attn_dropout=m.attn_dropout, loss_type=m.loss_type,
         )

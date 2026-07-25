@@ -32,6 +32,13 @@ _MODEL_EMBED_HEAD = ModelConfig(
     n_ffn=1024, n_layer=0, block_size=128,
 )
 
+# same 0-layer shape but trained with MSE-vs-one-hot instead of cross-entropy
+# (run through vanilla_model.py, which reads loss_type in its forward()).
+_MODEL_EMBED_HEAD_MSE = ModelConfig(
+    vocab_size=1024, n_embd=192, n_head=6, head_dim=32,
+    n_ffn=1024, n_layer=0, block_size=128, loss_type="mse",
+)
+
 # "mlp10" model: 5 blocks, each block's attention slot replaced by a second FFN
 # (block_type="mlp"), so the model is 10 FFN sub-layers + embed + lm_head, no
 # attention. Same d/d_ff as model C.
@@ -46,12 +53,30 @@ _MODEL_l5 = ModelConfig(
     n_ffn=1024, n_layer=5, block_size=128,
 )
 
+# Layer = 20
+_MODEL_l20 = ModelConfig(
+    vocab_size=1024, n_embd=192, n_head=6, head_dim=32,
+    n_ffn=1024, n_layer=20, block_size=128,
+)
+
 # 5-layer transformer for the REAL-DATA FineWeb-10B corpus: GPT-2 BPE vocab
 # (50257 padded to a multiple of 64) and a 1024-token context. Same d/d_ff/
 # n_head as the synth model C, only vocab_size / block_size / n_layer differ.
-_MODEL_fw10B = ModelConfig(
+_MODEL_fw10B_l5 = ModelConfig(
     vocab_size=50304, n_embd=192, n_head=6, head_dim=32,
     n_ffn=1024, n_layer=5, block_size=1024,
+)
+
+_MODEL_fw10B_l20 = ModelConfig(
+    vocab_size=50304, n_embd=192, n_head=6, head_dim=32,
+    n_ffn=1024, n_layer=20, block_size=1024,
+)
+
+# 1-layer variant, matching the legacy pre-preset run vanilla_fineweb10B-adamw
+# (train_vanilla_transformer_fineweb10B.py: same shape, n_layer=1).
+_MODEL_fw10B_l1 = ModelConfig(
+    vocab_size=50304, n_embd=192, n_head=6, head_dim=32,
+    n_ffn=1024, n_layer=1, block_size=1024,
 )
 
 _CKPT_9 = {"init": 0.0, "p10": 0.10, "p25": 0.25, "p40": 0.40, "p50": 0.50,
@@ -84,6 +109,34 @@ EXPERIMENTS = {
         train=TrainConfig(max_iters=8000, run_name="vanilla_imbalance_s1-adamw",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="vanilla_imbalance_s1-adamw"),
+    ),
+
+    # ---- 1-layer transformer on the BALANCED V=1024 synth data (SGD) ----
+    # mirrors imbalance_s1_sgd, only the dataset differs (balance vs zipf).
+    "balance_sgd": ExperimentConfig(
+        name="balance_sgd",
+        model=copy.deepcopy(_MODEL_C),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="vanilla_balance-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="vanilla_balance-sgd"),
+    ),
+
+    # ---- 1-layer transformer on the BALANCED V=1024 synth data (AdamW) ----
+    "balance_adamw": ExperimentConfig(
+        name="balance_adamw",
+        model=copy.deepcopy(_MODEL_C),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="vanilla_balance-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="vanilla_balance-adamw"),
     ),
 
     # ---- simpliest: embedding + lm_head only (n_layer=0), SGD, same data ----
@@ -140,10 +193,65 @@ EXPERIMENTS = {
         analyze=AnalyzeConfig(files_name="simpliest_balance-adamw"),
     ),
 
+    # ---- 0-layer transformer trained with MSE loss (vs one-hot targets) ----
+    # embed + lm_head only, run via vanilla_model.py (loss_type="mse").
+    # 4 presets: {imbalance, balance} x {sgd, adamw}.
+    "mse0_sgd-imbalance": ExperimentConfig(
+        name="mse0_sgd-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mse0_imbalance_s1-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_imbalance_s1-sgd"),
+    ),
+
+    "mse0_sgd-balance": ExperimentConfig(
+        name="mse0_sgd-balance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mse0_balance-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_balance-sgd"),
+    ),
+
+    "mse0_adamw-imbalance": ExperimentConfig(
+        name="mse0_adamw-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mse0_imbalance_s1-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_imbalance_s1-adamw"),
+    ),
+
+    "mse0_adamw-balance": ExperimentConfig(
+        name="mse0_adamw-balance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mse0_balance-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_balance-adamw"),
+    ),
+
     # ---- simpliest on the 1B zipf-IMBALANCED synth data, SGD ----
-    # 100x more tokens than the 10M sets, so max_iters is bumped 8k -> 80k
-    # (~655M tokens seen, well under one epoch => no repeat sampling) and
-    # warmup scaled proportionally (2.5% of the schedule, as before).
+    # 100x more tokens than the 10M sets, so max_iters is bumped 8k -> 130k
+    # (130k * 64 * 128 ~= 1.065B tokens ~= 1.06 epochs => ~one pass, no heavy
+    # repeat sampling) with warmup 2000 (~1.5% of the schedule; note this is
+    # lower than the 2.5% used by the 10M presets -- warmup was NOT rescaled
+    # when max_iters moved from the original 80k plan to 130k).
     "simpliest_imbalance_1B_sgd": ExperimentConfig(
         name="simpliest_imbalance_1B_sgd",
         model=copy.deepcopy(_MODEL_EMBED_HEAD),
@@ -202,7 +310,8 @@ EXPERIMENTS = {
         name="layer5-imbalance-s1-adamw",
         model=copy.deepcopy(_MODEL_l5),
         data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
-        optim=OptimConfig(name="adamw", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
                     warmup_iters=200),
         train=TrainConfig(max_iters=8000, run_name="layer5-imbalance-s1-adamw",
@@ -215,7 +324,8 @@ EXPERIMENTS = {
         name="layer5-balance-adamw",
         model=copy.deepcopy(_MODEL_l5),
         data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
-        optim=OptimConfig(name="adamw", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
                     warmup_iters=200),
         train=TrainConfig(max_iters=8000, run_name="layer5-balance-adamw",
@@ -229,7 +339,8 @@ EXPERIMENTS = {
         name="layer5-balance-1B-adamw",
         model=copy.deepcopy(_MODEL_l5),
         data=DataConfig(dataset="synth_uniform_balanced_V1024_1B", batch_size=64),
-        optim=OptimConfig(name="adamw", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
                     warmup_iters=2000),
         train=TrainConfig(max_iters=130000, run_name="layer5-balance-1B-adamw",
@@ -243,13 +354,102 @@ EXPERIMENTS = {
         name="layer5-imbalance-s1-1B-adamw",
         model=copy.deepcopy(_MODEL_l5),
         data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024_1B", batch_size=64),
-        optim=OptimConfig(name="adamw", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
                     warmup_iters=2000),
         train=TrainConfig(max_iters=130000, run_name="layer5-imbalance-s1-1B-adamw",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="layer5-imbalance-s1-1B-adamw"),
     ),
+
+
+# ---------------------------------------- Layer = 20 ------------------------------------------
+
+# ----------------------- SGD imbalance ---------------------
+    "layer20-imbalance-s1-sgd": ExperimentConfig(
+        name="layer20-imbalance-s1-sgd",
+        model=copy.deepcopy(_MODEL_l20),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer20-imbalance-s1-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-imbalance-s1-sgd"),
+    ),
+
+    # ----------------------- SGD balance ---------------------
+    "layer20-balance-sgd": ExperimentConfig(
+        name="layer20-balance-sgd",
+        model=copy.deepcopy(_MODEL_l20),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer20-balance-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-balance-sgd"),
+    ),
+
+    # ----------------------- Adamw imbalance ---------------------
+    "layer20-imbalance-s1-adamw": ExperimentConfig(
+        name="layer20-imbalance-s1-adamw",
+        model=copy.deepcopy(_MODEL_l20),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer20-imbalance-s1-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-imbalance-s1-adamw"),
+    ),
+
+        # ----------------------- Adam balance ---------------------
+    "layer20-balance-adamw": ExperimentConfig(
+        name="layer20-balance-adamw",
+        model=copy.deepcopy(_MODEL_l20),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer20-balance-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-balance-adamw"),
+    ),
+
+        # ---------------------- Adam balance 1B --------------------
+    
+    "layer20-balance-1B-adamw": ExperimentConfig(
+        name="layer20-balance-1B-adamw",
+        model=copy.deepcopy(_MODEL_l20),
+        data=DataConfig(dataset="synth_uniform_balanced_V1024_1B", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=2000),
+        train=TrainConfig(max_iters=130000, run_name="layer20-balance-1B-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-balance-1B-adamw"),
+    ),
+
+        # ---------------------- Adam imbalance 1B --------------------
+    
+    "layer20-imbalance-s1-1B-adamw": ExperimentConfig(
+        name="layer20-imbalance-s1-1B-adamw",
+        model=copy.deepcopy(_MODEL_l20),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024_1B", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
+                    warmup_iters=2000),
+        train=TrainConfig(max_iters=130000, run_name="layer20-imbalance-s1-1B-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-imbalance-s1-1B-adamw"),
+    ),
+
 
 #   ------------------------- mlp10: 5 blocks, attn replaced by FFN (no attention) -----------
 #   10 FFN sub-layers + embed + lm_head. 10M data, max_iters 8k -> 20k for the
@@ -262,8 +462,8 @@ EXPERIMENTS = {
         data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
         optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
-                    warmup_iters=500),
-        train=TrainConfig(max_iters=20000, run_name="mlp10_imbalance_s1-sgd",
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mlp10_imbalance_s1-sgd",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="mlp10_imbalance_s1-sgd"),
     ),
@@ -275,8 +475,8 @@ EXPERIMENTS = {
         data=DataConfig(dataset="synth_uniform_balanced_V1024", batch_size=64),
         optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
-                    warmup_iters=500),
-        train=TrainConfig(max_iters=20000, run_name="mlp10_balance-sgd",
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mlp10_balance-sgd",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="mlp10_balance-sgd"),
     ),
@@ -289,8 +489,8 @@ EXPERIMENTS = {
         optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
                           grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
-                    warmup_iters=500),
-        train=TrainConfig(max_iters=20000, run_name="mlp10_imbalance_s1-adamw",
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mlp10_imbalance_s1-adamw",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="mlp10_imbalance_s1-adamw"),
     ),
@@ -303,14 +503,14 @@ EXPERIMENTS = {
         optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
                           grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5,
-                    warmup_iters=500),
-        train=TrainConfig(max_iters=20000, run_name="mlp10_balance-adamw",
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="mlp10_balance-adamw",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="mlp10_balance-adamw"),
     ),
 
 
-#   ------------------------- fineweb10B: 5-layer transformer on REAL data -----------
+#   ------------------------- fineweb10B: 5-layer/20 layer transformer on REAL data -----------
 #   GPT-2 BPE (vocab 50304), 1024-token context, AdamW. Training budget follows
 #   train_vanilla_transformer_fineweb10B.py (20k iters, bs=32, warmup=400,
 #   lr 6e-4 -> 6e-5). Data lives in <repo-root>/data/fineweb10B/ as modded-nanoGPT
@@ -318,7 +518,7 @@ EXPERIMENTS = {
 
     "layer5-fineweb10B-adamw": ExperimentConfig(
         name="layer5-fineweb10B-adamw",
-        model=copy.deepcopy(_MODEL_fw10B),
+        model=copy.deepcopy(_MODEL_fw10B_l5),
         data=DataConfig(dataset="fineweb10B", format="nanogpt_shards", batch_size=32),
         optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
                           grad_clip=1.0),
@@ -326,25 +526,86 @@ EXPERIMENTS = {
                     warmup_iters=400),
         train=TrainConfig(max_iters=20000, run_name="layer5-fineweb10B-adamw",
                           ckpt_fracs=dict(_CKPT_9)),
-        analyze=AnalyzeConfig(files_name="layer5-fineweb10B-adamw"),
+        analyze=AnalyzeConfig(files_name="layer5-fineweb10B-adamw",
+                               max_classes=1024, max_tokens=1024,
+                               token_select="freq"),
     ),
 
     "layer5-fineweb10B-sgd": ExperimentConfig(
         name="layer5-fineweb10B-sgd",
-        model=copy.deepcopy(_MODEL_fw10B),
+        model=copy.deepcopy(_MODEL_fw10B_l5),
         data=DataConfig(dataset="fineweb10B", format="nanogpt_shards", batch_size=32),
         optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
         lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=6e-5,
                     warmup_iters=400),
         train=TrainConfig(max_iters=20000, run_name="layer5-fineweb10B-sgd",
                           ckpt_fracs=dict(_CKPT_9)),
-        analyze=AnalyzeConfig(files_name="layer5-fineweb10B-sgd"),
+        analyze=AnalyzeConfig(files_name="layer5-fineweb10B-sgd",
+                               max_classes=1024, max_tokens=1024,
+                               token_select="freq"),
     ),
 
+    "layer20-fineweb10B-adamw": ExperimentConfig(
+        name="layer20-fineweb10B-adamw",
+        model=copy.deepcopy(_MODEL_fw10B_l20),
+        data=DataConfig(dataset="fineweb10B", format="nanogpt_shards", batch_size=32),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=6e-5,
+                    warmup_iters=400),
+        train=TrainConfig(max_iters=20000, run_name="layer20-fineweb10B-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-fineweb10B-adamw",
+                               max_classes=1024, max_tokens=1024,
+                               token_select="freq"),
+    ),
+
+    "layer20-fineweb10B-sgd": ExperimentConfig(
+        name="layer20-fineweb10B-sgd",
+        model=copy.deepcopy(_MODEL_fw10B_l20),
+        data=DataConfig(dataset="fineweb10B", format="nanogpt_shards", batch_size=32),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=6e-5,
+                    warmup_iters=400),
+        train=TrainConfig(max_iters=20000, run_name="layer20-fineweb10B-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer20-fineweb10B-sgd",
+                               max_classes=1024, max_tokens=1024,
+                               token_select="freq"),
+    ),
+
+    "vanilla_fineweb10B-adamw": ExperimentConfig(
+        name="vanilla_fineweb10B-adamw",
+        model=copy.deepcopy(_MODEL_fw10B_l1),
+        data=DataConfig(dataset="fineweb10B", format="nanogpt_shards", batch_size=32),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1,
+                          grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=6e-5,
+                    warmup_iters=400),
+        train=TrainConfig(max_iters=20000, run_name="vanilla_fineweb10B-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="vanilla_fineweb10B-adamw",
+                               max_classes=1024, max_tokens=1024,
+                               token_select="freq"),
+    ),
+
+    "vanilla_fineweb10B-sgd": ExperimentConfig(
+        name="vanilla_fineweb10B-sgd",
+        model=copy.deepcopy(_MODEL_fw10B_l1),
+        data=DataConfig(dataset="fineweb10B", format="nanogpt_shards", batch_size=32),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=6e-5,
+                    warmup_iters=400),
+        train=TrainConfig(max_iters=20000, run_name="vanilla_fineweb10B-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="vanilla_fineweb10B-sgd",
+                               max_classes=1024, max_tokens=1024,
+                               token_select="freq"),
+    ),
 }
 
 # the preset load() falls back to when no name is given
-DEFAULT = "imbalance_s1_sgd"
+DEFAULT = ""
 
 
 def get(name):
