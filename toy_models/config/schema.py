@@ -71,13 +71,23 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class OptimConfig:
-    name: str = "sgd"                       # "sgd" | "adamw" | "adam"
+    name: str = "sgd"                       # "sgd" | "adamw" | "adam" | "muon"
     weight_decay: float = 0.1
     momentum: float = 0.9                   # SGD momentum
     nesterov: bool = False                  # SGD nesterov
-    betas: Tuple[float, float] = (0.9, 0.95)  # Adam(W) betas
+    betas: Tuple[float, float] = (0.9, 0.95)  # Adam(W) betas; also Muon's aux-AdamW betas
     eps: float = 1e-8                       # Adam(W) epsilon
     grad_clip: float = 1.0                  # 0 disables gradient clipping
+    # ---- Muon, Moonlight version (hidden 2D weight matrices; everything else
+    # ---- falls back to an internal AdamW group -- see build.Muon) ----
+    muon_momentum: float = 0.95             # momentum of the orthogonalized update
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5                  # Newton-Schulz iterations
+    # LR of the aux AdamW group = scheduled lr * this scale. The Moonlight
+    # update is RMS-matched to AdamW (0.2*sqrt(max(d_out,d_in)) scaling), so
+    # both groups share the same lr by default; keep 1.0 unless deliberately
+    # decoupling the embeds/head LR.
+    muon_aux_lr_scale: float = 1.0
 
 
 # ---------------------------------------------------------------------------

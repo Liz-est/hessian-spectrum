@@ -120,7 +120,9 @@ def main():
 
     # optimizer + LR schedule are built from the config (name-dispatched),
     # so switching sgd<->adamw or cosine<->constant is a config change only.
-    optimizer = cfgmod.build_optimizer(model.parameters(), cfg.optim)
+    # (muon would need hidden matrices -- build_optimizer rejects it for this
+    # embed+lmhead-only model.)
+    optimizer = cfgmod.build_optimizer(raw_model, cfg.optim)
     get_lr = cfgmod.make_lr_fn(cfg.lr, max_iters)
 
     @torch.no_grad()

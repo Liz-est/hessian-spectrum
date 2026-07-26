@@ -39,6 +39,11 @@ _MODEL_EMBED_HEAD_MSE = ModelConfig(
     n_ffn=1024, n_layer=0, block_size=128, loss_type="mse",
 )
 
+_MODEL_l5_MSE = ModelConfig(
+    vocab_size=1024, n_embd=192, n_head=6, head_dim=32,
+    n_ffn=1024, n_layer=5, block_size=128, loss_type="mse",
+)
+
 # "mlp10" model: 5 blocks, each block's attention slot replaced by a second FFN
 # (block_type="mlp"), so the model is 10 FFN sub-layers + embed + lm_head, no
 # attention. Same d/d_ff as model C.
@@ -602,6 +607,74 @@ EXPERIMENTS = {
                                max_classes=1024, max_tokens=1024,
                                token_select="freq"),
     ),
+
+#-----------------------Layer5 + MSE loss----------------------------
+
+    # imbalance data + SGD
+    "layer5-mse-imbalance-s1-sgd": ExperimentConfig(
+        name="layer5-mse-imbalance-s1-sgd",
+        model=copy.deepcopy(_MODEL_l5_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.25, min_lr=0.0125,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-sgd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-sgd"),
+    ),
+
+    # imbalance data + SGD + no gradient clipping
+    "layer5-mse-imbalance-s1-sgd-gradclip0": ExperimentConfig(
+        name="layer5-mse-imbalance-s1-sgd-gradclip0",
+        model=copy.deepcopy(_MODEL_l5_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.1, min_lr=0.005,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-sgd-gradclip0",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-sgd-gradclip0"),
+    ),
+
+    # imbalance data + AdamW
+    "layer5-mse-imbalance-s1-adamw": ExperimentConfig(
+        name="layer5-mse-imbalance-s1-adamw",
+        model=copy.deepcopy(_MODEL_l5_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-4, min_lr=0.075e-4,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-adamw",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-adamw"),
+    ),
+
+    # imbalance data + Muon
+    "layer5-mse-imbalance-s1-muon": ExperimentConfig(
+        name="layer5-mse-imbalance-s1-muon",
+        model=copy.deepcopy(_MODEL_l5_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="muon", weight_decay=0.1, grad_clip=1.0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-4, min_lr=0.075e-4,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-muon",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-muon"),
+    ),
+
+    # imbalance data + Muon + no gradient clipping
+    "layer5-mse-imbalance-s1-muon": ExperimentConfig(
+        name="layer5-mse-imbalance-s1-muon-gradclip0",
+        model=copy.deepcopy(_MODEL_l5_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="muon", weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-4, min_lr=0.075e-4,
+                    warmup_iters=200),
+        train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-muon",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-muon"),
+    ),
+
 }
 
 # the preset load() falls back to when no name is given

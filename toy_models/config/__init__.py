@@ -36,8 +36,17 @@ __all__ = [
 
 
 def load(name=None):
-    """Return a deep-copied ExperimentConfig for `name` (or the DEFAULT preset)."""
-    return get(name or DEFAULT)
+    """Return a deep-copied ExperimentConfig for `name` (or the DEFAULT preset).
+
+    With no name and an empty DEFAULT, return a schema-default ExperimentConfig
+    as a placeholder -- the usual entry-script idiom
+    `apply_overrides(load(), sys.argv[1:])` then replaces it wholesale when the
+    first CLI token names a preset.
+    """
+    name = name or DEFAULT
+    if not name:
+        return ExperimentConfig()
+    return get(name)
 
 
 def _coerce(cur, val):

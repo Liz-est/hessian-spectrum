@@ -160,8 +160,10 @@ def main():
         raw_model = model.module
 
     # optimizer + LR schedule are built from the config (name-dispatched),
-    # so switching sgd<->adamw or cosine<->constant is a config change only.
-    optimizer = cfgmod.build_optimizer(model.parameters(), cfg.optim)
+    # so switching sgd<->adamw<->muon or cosine<->constant is a config change
+    # only. Pass the unwrapped model (not .parameters()): muon routes params by
+    # name/shape; the other optimizers just take its .parameters().
+    optimizer = cfgmod.build_optimizer(raw_model, cfg.optim)
     get_lr = cfgmod.make_lr_fn(cfg.lr, max_iters)
 
     @torch.no_grad()
