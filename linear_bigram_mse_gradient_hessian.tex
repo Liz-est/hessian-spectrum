@@ -1,0 +1,427 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+
+\definecolor{HessianPurple}{HTML}{6F42C1}
+\definecolor{HessianPurpleLight}{HTML}{F5F1FC}
+\newtcolorbox{hessianhighlight}{
+  enhanced,
+  breakable,
+  colback=HessianPurpleLight,
+  colframe=HessianPurple,
+  colbacktitle=HessianPurple,
+  coltitle=white,
+  fonttitle=\bfseries,
+  title={Distributional dependence of the Hessian blocks},
+  boxrule=0.8pt,
+  arc=2pt,
+  left=7pt,
+  right=7pt,
+  top=6pt,
+  bottom=6pt
+}
+\usepackage[
+  colorlinks=true,
+  linkcolor=HessianPurple,
+  citecolor=HessianPurple,
+  urlcolor=HessianPurple
+]{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\BlockDiag}{\operatorname{BlockDiag}}
+\newcommand{\ip}[2]{\left\langle #1,#2\right\rangle_F}
+
+\title{Hessian Structure of a Linear Bigram Model}
+\author{Senmiao Wang}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note derives the gradient and Hessian of an untied two-layer linear
+bigram model trained with the full-vector mean squared error.  The diagonal
+Hessian blocks reveal two distinct effects of data imbalance.  Across
+embedding columns, block heterogeneity is determined solely by the input-token
+distribution.  Across rows of the language-model head, all Hessian blocks are
+identical for arbitrary input and output distributions: the input distribution
+changes their common value, whereas the conditional target distribution does
+not enter these blocks.  The conditional target distribution affects the
+gradient and the residual-dependent part of the cross-layer Hessian.
+\end{abstract}
+
+\section{Problem Setting}
+
+We study population risk minimization for bigram prediction.  We first specify
+the data-generating distribution, which determines the form of token
+imbalance, and then introduce the two-layer linear network and its training
+objective.
+
+\paragraph{Bigram prediction problem and data distribution.}
+Let \(C\) be the number of token classes and let
+\(\bm{e}_1,\ldots,\bm{e}_C\in\R^C\) be the standard basis vectors.  A bigram
+sample consists of an input token \(x=\bm{e}_i\) and its next-token target
+\(y=\bm{e}_j\).  We assume that \((x,y)\) follows a population distribution
+\(\mathcal{D}\) specified by the input-token probabilities
+\(\pi=(\pi_1,\ldots,\pi_C)\) and the conditional next-token probabilities
+\begin{equation*}
+\pi_i=\Pr(x=\bm{e}_i),
+\qquad
+\pi_{j\mid i}=\Pr(y=\bm{e}_j\mid x=\bm{e}_i),
+\end{equation*}
+where \(\sum_i\pi_i=1\) and \(\sum_j\pi_{j\mid i}=1\) for every input class
+with \(\pi_i>0\).  The joint and output-token probabilities are therefore
+\begin{equation*}
+\Pr(x=\bm{e}_i,y=\bm{e}_j)=\pi_i\pi_{j\mid i},
+\qquad
+\pi_j^{\mathrm{out}}
+=\Pr(y=\bm{e}_j)
+=\sum_{i=1}^C\pi_i\pi_{j\mid i}.
+\end{equation*}
+For each input class, collect its conditional next-token distribution in
+\begin{equation*}
+\bm{\pi}_{\cdot\mid i}
+=
+\begin{bmatrix}
+\pi_{1\mid i}&\cdots&\pi_{C\mid i}
+\end{bmatrix}^{\!\top}
+=\E[y\mid x=\bm{e}_i].
+\end{equation*}
+We also define the diagonal matrix of input-token probabilities as
+\begin{equation*}
+D_\pi=\diag(\pi_1,\ldots,\pi_C).
+\end{equation*}
+In this formulation, input-token imbalance corresponds to nonuniform
+\(\pi_i\), while the conditional probabilities \(\pi_{j\mid i}\) determine
+how the next-token distribution varies with the input.
+
+\paragraph{Two-layer linear network and training objective.}
+Let \(d\) be the hidden dimension.  The network consists of an embedding
+matrix \(W\) and a language-model head \(V\):
+\begin{equation*}
+W\in\R^{d\times C},
+\qquad
+V\in\R^{C\times d}.
+\end{equation*}
+For an input \(x=\bm{e}_i\), the \(i\)-th embedding column
+\(w_i=W\bm{e}_i\) is the hidden representation, and the network prediction is
+\begin{equation*}
+h=Wx=w_i,
+\qquad
+f(V,W;x)=Vh=VWx.
+\end{equation*}
+Given a target \(y\), define the prediction error by
+\begin{equation*}
+e=f(V,W;x)-y=VWx-y.
+\end{equation*}
+Here \(e\) denotes the prediction error, whereas the bold symbol
+\(\bm{e}_i\) denotes a standard basis vector.
+
+We train both layers by minimizing the population full-vector MSE:
+\begin{equation}
+\mathcal{L}(V,W)
+=\frac12\E_{(x,y)\sim\mathcal{D}}\!\left[\|VWx-y\|_2^2\right]
+=\frac12\E_{(x,y)\sim\mathcal{D}}\!\left[e^\top e\right].
+\label{eq:loss}
+\end{equation}
+Conditioning \eqref{eq:loss} on the input token yields
+\begin{equation*}
+\mathcal{L}(V,W)
+=\frac12\sum_{i=1}^C
+\pi_i\|Vw_i-\bm{\pi}_{\cdot\mid i}\|_2^2
++\text{constant}.
+\end{equation*}
+Thus, up to a parameter-independent term, training is a weighted
+factorization of the conditional bigram probabilities, with weights given by
+the input-token distribution.
+
+\section{Calculation of the Gradients and Hessian}
+
+Because \(x\) and \(y\) are fixed under parameter differentiation, the first
+differential of the error is
+\begin{equation*}
+de=d(VWx)=dV\,Wx+V\,dW\,x.
+\end{equation*}
+It follows from \eqref{eq:loss} that
+\begin{equation*}
+d\mathcal{L}
+=\E\!\left[
+e^\top\!\left(dV\,Wx+V\,dW\,x\right)
+\right].
+\end{equation*}
+Using the Frobenius inner product
+\(\ip{A}{B}=\tr(A^\top B)\), the two terms satisfy
+\begin{equation*}
+e^\top dV\,h=\ip{eh^\top}{dV},
+\qquad
+e^\top V\,dW\,x=\ip{V^\top e x^\top}{dW}.
+\end{equation*}
+Therefore, the population gradients are
+\begin{equation}
+\begin{aligned}
+\nabla_V\mathcal{L}
+&=\E[eh^\top]
+=\sum_{i=1}^C
+\pi_i\left(Vw_i-\bm{\pi}_{\cdot\mid i}\right)w_i^\top,\\
+\nabla_W\mathcal{L}
+&=\E[V^\top e x^\top]
+=\sum_{i=1}^C
+\pi_iV^\top\left(Vw_i-\bm{\pi}_{\cdot\mid i}\right)\bm{e}_i^\top.
+\end{aligned}
+\label{eq:gradients}
+\end{equation}
+In particular, the gradient with respect to the \(i\)-th embedding column is
+\begin{equation*}
+\nabla_{w_i}\mathcal{L}
+=\pi_iV^\top\left(Vw_i-\bm{\pi}_{\cdot\mid i}\right).
+\end{equation*}
+Equation~\eqref{eq:gradients} shows that both the input probability \(\pi_i\)
+and the conditional target probabilities \(\pi_{j\mid i}\) affect the
+gradients.
+
+The model output is bilinear in \(V\) and \(W\), so differentiating the error
+a second time gives
+\begin{equation*}
+d^2e=d^2(VWx)=2\,dV\,dW\,x.
+\end{equation*}
+The factor of two collects the two product-rule contributions.  Hence the
+complete Hessian quadratic form is
+\begin{equation}
+d^2\mathcal{L}
+=\E\!\left[
+\left\|dV\,Wx+V\,dW\,x\right\|_2^2
++2e^\top dV\,dW\,x
+\right].
+\label{eq:full-hessian}
+\end{equation}
+Equivalently,
+\begin{equation*}
+\begin{aligned}
+d^2\mathcal{L}
+=\E\Big[
+&\|dV\,Wx\|_2^2
++\|V\,dW\,x\|_2^2\\
+&+2(dV\,Wx)^\top V\,dW\,x
++2e^\top dV\,dW\,x
+\Big].
+\end{aligned}
+\end{equation*}
+The first two terms define the two within-layer, or diagonal, Hessian blocks.
+The final two terms define the cross-layer blocks.  The prediction error
+appears only in the cross-layer contribution because the model is linear in
+each parameter matrix separately but bilinear in the pair.
+
+\section{Hessian Block Structure and Effect of Data Imbalance}
+\label{sec:hessian-blocks}
+
+We now state the Hessian block structure and its distributional dependence.
+The detailed blockwise calculations are deferred to
+Appendix~\ref{app:hessian-calculations}.
+
+\paragraph{Embedding-layer diagonal block.}
+The embedding matrix is partitioned by columns along the input-vocabulary
+direction,
+\begin{equation*}
+W=
+\begin{bmatrix}
+w_1&\cdots&w_C
+\end{bmatrix},
+\end{equation*}
+with one parameter block \(w_i\in\R^d\) for each input token.  Under the
+corresponding column-wise vectorization, the embedding-layer Hessian is
+\begin{equation}
+\begin{aligned}
+H_{WW}
+&=\BlockDiag\!\left(
+\pi_1V^\top V,\ldots,\pi_CV^\top V
+\right)
+=D_\pi\otimes V^\top V,\\
+H_{WW}^{(i)}
+&=\pi_iV^\top V,
+\qquad
+H_{WW}[dW]=V^\top V\,dW\,D_\pi.
+\end{aligned}
+\label{eq:embedding-hessian}
+\end{equation}
+At fixed \(V\), all embedding blocks have the common shape \(V^\top V\);
+their block-to-block heterogeneity is determined entirely by the input
+probabilities \(\pi_i\).  Neither the conditional target distribution nor the
+output marginal appears in \eqref{eq:embedding-hessian}.
+Equivalently, its input-vocabulary block structure is
+\begin{equation*}
+H_{WW}
+=
+\begin{bmatrix}
+\pi_1V^\top V & 0 & \cdots & 0\\
+0 & \pi_2V^\top V & \cdots & 0\\
+\vdots & \vdots & \ddots & \vdots\\
+0 & 0 & \cdots & \pi_CV^\top V
+\end{bmatrix}.
+\end{equation*}
+
+\paragraph{LM-head diagonal block.}
+The LM head is partitioned by rows along the output-vocabulary direction,
+\begin{equation*}
+V=
+\begin{bmatrix}
+v_1^\top\\
+\vdots\\
+v_C^\top
+\end{bmatrix},
+\end{equation*}
+with one parameter block \(v_a\in\R^d\) for each output token.  The LM-head
+Hessian satisfies
+\begin{equation}
+\begin{aligned}
+H_{VV}
+&=\BlockDiag\!\left(
+WD_\pi W^\top,\ldots,WD_\pi W^\top
+\right)
+=I_C\otimes\left(WD_\pi W^\top\right),\\
+H_{VV}^{(1)}
+&=\cdots=H_{VV}^{(C)}=WD_\pi W^\top,\\
+H_{VV}[dV]
+&=dV\,WD_\pi W^\top.
+\end{aligned}
+\label{eq:head-hessian}
+\end{equation}
+Thus all output-class blocks are identical for arbitrary input and output
+distributions.  Their common block is
+\(WD_\pi W^\top=\sum_i\pi_iw_iw_i^\top\).  Therefore, nonuniform input
+probabilities can unequally weight the embedding directions and induce or
+amplify spectral anisotropy within every common block, even though they cannot
+create block-to-block heterogeneity across output tokens.  The target
+distribution does not enter \eqref{eq:head-hessian}.
+Equivalently, its output-vocabulary block structure is
+\begin{equation*}
+H_{VV}
+=
+\begin{bmatrix}
+WD_\pi W^\top & 0 & \cdots & 0\\
+0 & WD_\pi W^\top & \cdots & 0\\
+\vdots & \vdots & \ddots & \vdots\\
+0 & 0 & \cdots & WD_\pi W^\top
+\end{bmatrix}.
+\end{equation*}
+
+\paragraph{Cross-layer blocks.}
+Let \(v_a^\top\) be the \(a\)-th row of \(V\), and define the conditional mean
+error
+\begin{equation*}
+\bar e_{i,a}=v_a^\top w_i-\pi_{a\mid i}.
+\end{equation*}
+With the convention that the Hessian quadratic form contains
+\(2\,dv_a^\top H_{v_a,w_i}dw_i\), the cross-layer block is
+\begin{equation}
+H_{v_a,w_i}
+=\pi_i\left(w_iv_a^\top+\bar e_{i,a}I_d\right).
+\label{eq:cross-block}
+\end{equation}
+Unlike the two diagonal Hessian blocks, the cross-layer block depends on the
+conditional target distribution through \(\bar e_{i,a}\).  When
+\(Vw_i=\bm{\pi}_{\cdot\mid i}\), this residual-dependent term vanishes, while
+the Gauss--Newton coupling \(\pi_iw_iv_a^\top\) generally remains.
+
+\begin{hessianhighlight}
+At fixed network parameters \(W\) and \(V\):
+\begin{itemize}
+  \item The heterogeneity of the embedding-layer blocks depends directly
+  only on the input-token probabilities \(\pi_i\).  It is independent of
+  \(\pi_{j\mid i}\) and the output marginal.
+  \item All LM-head blocks are identical and equal to \(WD_\pi W^\top\).
+  Input imbalance cannot create block-to-block heterogeneity across output
+  tokens, but its unequal weighting of embedding directions can induce or
+  amplify spectral heterogeneity within every common block.
+  \item The conditional target distribution affects Hessian curvature only
+  through the residual-dependent part of the cross-layer blocks.
+\end{itemize}
+\end{hessianhighlight}
+
+\newpage
+\appendix
+\section{Detailed Hessian Block Calculations}
+\label{app:hessian-calculations}
+
+This appendix derives the block formulas stated in
+Section~\ref{sec:hessian-blocks}.  We start from the complete Hessian
+quadratic form in \eqref{eq:full-hessian}.
+
+\paragraph{Embedding-layer diagonal block.}
+Setting \(dV=0\) in \eqref{eq:full-hessian} gives
+\begin{equation*}
+d_W^2\mathcal{L}
+=\E\!\left[\|V\,dW\,x\|_2^2\right].
+\end{equation*}
+Since \(x=\bm{e}_i\), write \(dw_i=dW\bm{e}_i\).  Averaging over the input
+distribution gives
+\begin{equation*}
+d_W^2\mathcal{L}
+=\sum_{i=1}^C
+\pi_i\,dw_i^\top V^\top V\,dw_i.
+\end{equation*}
+There are no terms coupling \(dw_i\) and \(dw_k\) for \(i\neq k\), which
+yields \eqref{eq:embedding-hessian}.  Consequently, for any homogeneous
+matrix norm and any \(\pi_k>0\),
+\begin{equation*}
+\frac{\|H_{WW}^{(i)}\|}{\|H_{WW}^{(k)}\|}
+=\frac{\pi_i}{\pi_k}.
+\end{equation*}
+If \(\pi_i=0\), then \(H_{WW}^{(i)}=0\), so the corresponding embedding is
+unidentified by the observed bigram distribution.  If every \(\pi_i>0\) and
+\(V\) has full column rank, then
+\begin{equation*}
+\kappa(H_{WW})
+=\frac{\pi_{\max}}{\pi_{\min}}\kappa(V^\top V)
+=\frac{\pi_{\max}}{\pi_{\min}}\kappa(V)^2.
+\end{equation*}
+Thus input imbalance and the geometry of the LM head contribute
+multiplicatively to ill-conditioning in the embedding layer.
+
+\paragraph{LM-head diagonal block.}
+Setting \(dW=0\) in \eqref{eq:full-hessian} gives
+\begin{equation*}
+d_V^2\mathcal{L}
+=\E\!\left[\|dV\,Wx\|_2^2\right].
+\end{equation*}
+Writing the \(a\)-th row of \(dV\) as \(dv_a^\top\), we obtain
+\begin{equation*}
+d_V^2\mathcal{L}
+=\tr\!\left(dV^\top dV\,WD_\pi W^\top\right)
+=\sum_{a=1}^C
+dv_a^\top\left(WD_\pi W^\top\right)dv_a,
+\end{equation*}
+which yields \eqref{eq:head-hessian}.  The target independence follows
+directly from
+\begin{equation*}
+d_V^2\!\left[\frac12\|Vw_i-y\|_2^2\right]
+=\|dV\,w_i\|_2^2,
+\end{equation*}
+which does not depend on \(y\).
+
+\paragraph{Cross-layer blocks.}
+The cross-layer contribution in \eqref{eq:full-hessian} is
+\begin{equation*}
+\begin{aligned}
+d_{VW}^2\mathcal{L}
+=2\sum_{i=1}^C\pi_i\Big[
+&(dV\,w_i)^\top V\,dw_i\\
+&+\left(Vw_i-\bm{\pi}_{\cdot\mid i}\right)^\top dV\,dw_i
+\Big].
+\end{aligned}
+\end{equation*}
+The bilinear term between \(dv_a\) and \(dw_i\) is
+\begin{equation*}
+2\pi_i\,dv_a^\top
+\left(w_iv_a^\top+\bar e_{i,a}I_d\right)dw_i.
+\end{equation*}
+Under the block convention stated before \eqref{eq:cross-block}, this gives
+the cross-layer result in \eqref{eq:cross-block}.
+
+\end{document}

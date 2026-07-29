@@ -315,6 +315,7 @@ $\approx 0.96$ 纳特（真实依赖）；$b = 0$ 时该超出量 $\approx 10^{-
 |------|------|
 | `transition.py` | 核心数学：`make_pi`（词频）、`build_transition`（构造 P）、马尔可夫采样、`build_coupling_kernel`/`sinkhorn_coupling`（异边际相关耦合）、诊断函数 |
 | `build_dataset.py` | 编排：采样 token 流、切 train/val、写双流 `*_x.bin`/`*_y.bin` + `meta.pkl`；三种 `label_mode`（shift / independent / coupled）的 writer |
+| `build_shuffled_dataset.py` | **只控边际、随机配对**的独立构造脚本（不用马尔可夫链）：π_x、π_y 精确计数 + 各自打乱后按位置配对，条件分布不受控。见文末专节 |
 | `configs/` | 示例配置：`uniform_balanced.py`、`zipf_imbalanced.py`、`real_aligned.py`、`xbalance_yzipf_s1.py`/`xzipf_s1_ybalance.py`（异边际独立）、`*_coupled.py`（异边际相关） |
 | `inspect_dataset.py` | 验证：经验词频 vs 目标 π、每行熵分布、P 局部热图，输出 `inspect.png` |
 
@@ -409,3 +410,77 @@ python build_dataset.py configs/xzipf_s1_ybalance.py
 要再加其它逐点模式（如固定的 token→token `relabel` 映射，或条件输出核 p(y|x_t)），
 在 `build_dataset.py` 的 `write_stream` 分派器里加一个 writer 即可；下游（双流 `.bin`、
 `meta.pkl`、trainer/Hessian 的 `get_batch`）都已支持任意 y。
+
+## 只控边际、随机配对的构造（`build_shuffled_dataset.py`）
+
+一个与上面马尔可夫链流程**完全独立**的构造脚本。动机来自线性 bigram 模型的 Hessian
+理论（`linear_bigram_mse_gradient_hessian.tex`）：两个对角 Hessian 块只依赖**边际**——
+$H_{WW} = D_{\pi_x} \otimes V^\top V$ 的块间异质性完全由输入边际 $\pi_x$ 决定，
+$H_{VV} = I \otimes (W D_{\pi_x} W^\top)$ 与目标分布无关；条件分布 $\pi_{j\mid i}$ 只进入
+梯度和交叉块。因此需要一种**只指定 $\pi_x$、$\pi_y$ 两个边际、对条件分布和时间结构
+完全不做控制**的数据，作为马尔可夫链构造的互补对照。
+
+### 构造
+
+1. **边际**：$\pi_x = \mathrm{Zipf}(\alpha_x)$、$\pi_y = \mathrm{Zipf}(\alpha_y)$
+   （复用 `make_pi`；$\alpha = 0$ 退化为 uniform。默认 $\alpha_x = 1$、$\alpha_y = 0$，
+   即 x 不均衡、y 均匀）。
+2. **精确计数**：最大余数法把 $N$ 个 token 按 $\pi$ 分配到各类
+   （$\mathrm{count}_i \approx N\pi_i$，$\sum_i \mathrm{count}_i = N$），
+   使**经验边际精确等于目标**——区别于马尔可夫链构造的"平稳意义上等于"，
+   TV(经验, 目标) 只剩 $\sim V/(2N)$ 的舍入下限。
+3. **随机配对**：x 的多重集与 y 的多重集**各自独立**均匀打乱，按位置对齐得
+   $(x_t, y_t)$。条件分布完全由随机配对产生（总体上 $x \perp y$、
+   $I(x_t;y_t) = 0$），时间方向可交换（无任何时序结构）。
+
+### 与 `build_dataset.py` 的对照
+
+| | `build_dataset.py`（马尔可夫链） | `build_shuffled_dataset.py`（打乱配对） |
+|---|---|---|
+| x 的时间结构 | 一阶马尔可夫链（`predictability` 可调） | 无（可交换序列） |
+| 边际 | 平稳/渐近意义上等于 π | **经验分布精确等于** π（精确计数） |
+| 条件分布 $\pi_{j\mid i}$ | 由 shift / independent / coupled 显式控制 | **不控制**，随机配对（总体 $x \perp y$） |
+
+### 超参数（均可 `key=value` 命令行覆盖）
+
+| 参数 | 默认 | 作用 |
+|------|------|------|
+| `vocab_size` | 1024 | 词表大小 V |
+| `n_train_tokens` | 100_000 | train 样本对数（默认按 full-batch 实验规模设置） |
+| `n_val_tokens` | 10_000 | val 样本对数 |
+| `alpha_x` | 1.0 | 输入边际 zipf 指数（0 = uniform） |
+| `alpha_y` | 0.0 | 输出边际 zipf 指数（0 = uniform） |
+| `seed` | 1337 | 随机种子 |
+| `out_dir` | `data/synth_shuffled_x1_y0_100k_V1024` | 输出目录 |
+
+### train/val 语义与 full-batch 用法
+
+生成与训练**解耦**：生成时永远写出 train + val 两组，full-batch 还是 minibatch
+是训练侧的决定，不影响数据格式。
+
+- **minibatch 实验**：从 train 采 minibatch，在 val 上评估（常规用法）。
+- **full-batch 实验**：生成一个 train 恰为目标规模（默认 100k）的数据集，把
+  **整个 train 分片作为一个 batch** 训练；评估与 Hessian 分析也在 train 上——
+  full-batch 下 $L_{\text{train}}$ 就是优化器下降的精确目标函数，它的梯度/Hessian
+  才是训练动态本身。val 不参与训练，留作可选的泛化对照。
+
+```bash
+cd data_construction
+
+# full-batch 数据集（默认即 100k train + 10k val）
+python build_shuffled_dataset.py
+
+# minibatch 规模
+python build_shuffled_dataset.py n_train_tokens=1000000 n_val_tokens=50000 out_dir=data/synth_shuffled_1M
+
+# 其它旋钮
+python build_shuffled_dataset.py vocab_size=2048 alpha_x=1.0 alpha_y=0.5
+```
+
+### 磁盘格式与校验
+
+输出与双流格式完全兼容（`train_x/y.bin`、`val_x/y.bin` 均为无 header 的 uint16，
+x/y 按下标对齐），下游 trainer / Hessian 估计器零改动可读。`meta.pkl` 中
+`P=None`、`K=None`（本构造没有转移矩阵和条件核）、`label_mode="shuffled_marginals"`、
+`pi`（$\pi_x$）与 `pi_y` 照常记录。脚本自检打印每个 split 的
+TV(经验边际, 目标边际)，应在 $\sim V/(2N)$ 的舍入下限量级。
