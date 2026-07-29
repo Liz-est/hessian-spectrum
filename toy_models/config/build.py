@@ -109,6 +109,35 @@ class Muon(torch.optim.Optimizer):
                     p.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)
 
 
+def freeze_submodules(model, spec):
+    """Freeze the submodules named in `spec` (TrainConfig.freeze).
+
+    `spec` is a comma-separated list of submodule names, resolved with
+    model.get_submodule (so dotted paths like "blocks.0","blocks.0.attn" work). Sets
+    requires_grad=False on every parameter under each named module; unknown
+    names raise (a typo silently training the layer would be worse). Call this
+    BEFORE the DDP wrap and build_optimizer: DDP only registers grad-requiring
+    params with its reducer, and build_optimizer drops frozen params entirely.
+    Returns {name: n_params_frozen} for logging.
+    """
+    frozen = {}
+    for name in filter(None, (s.strip() for s in spec.split(","))):
+        try:
+            sub = model.get_submodule(name)
+        except AttributeError:
+            avail = ", ".join(n for n, _ in model.named_children())
+            raise ValueError(
+                f"train.freeze: no submodule {name!r} (top-level: {avail})")
+        n = 0
+        for p in sub.parameters():
+            p.requires_grad = False
+            n += p.numel()
+        if n == 0:
+            raise ValueError(f"train.freeze: submodule {name!r} has no parameters")
+        frozen[name] = n
+    return frozen
+
+
 def build_optimizer(params, cfg):
     """Construct a torch optimizer from an OptimConfig.
 
@@ -124,6 +153,9 @@ def build_optimizer(params, cfg):
     module = None
     if isinstance(params, torch.nn.Module):
         module, params = params, params.parameters()
+    # drop frozen params (e.g. train.freeze_lm_head) so they never enter the
+    # optimizer: no state, no weight decay, nothing for grad clipping to see.
+    params = [p for p in params if p.requires_grad]
     if name == "sgd":
         return torch.optim.SGD(
             params, lr=lr, momentum=cfg.momentum, nesterov=cfg.nesterov,

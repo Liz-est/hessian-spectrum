@@ -148,6 +148,15 @@ def main():
             return x.to(device), y.to(device)
 
     model = ToyVanilla(model_cfg).to(device)
+    # freeze the submodules named in train.freeze (e.g. "lm_head,tok_emb")
+    # BEFORE the DDP wrap and the optimizer build: DDP only registers
+    # grad-requiring params with its reducer, and build_optimizer drops frozen
+    # params, so they stay at their init values.
+    if cfg.train.freeze:
+        frozen = cfgmod.freeze_submodules(model, cfg.train.freeze)
+        if is_master:
+            desc = ", ".join(f"{k} ({v} params)" for k, v in frozen.items())
+            print(f"frozen at init: {desc}")
     raw_model = model
     if is_ddp:
         ddp_kwargs = {"device_ids": [int(os.environ.get("LOCAL_RANK", rank))]} \

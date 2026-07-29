@@ -36,6 +36,7 @@ class ToyVanillaConfig:
     dropout: float = 0.0
     attn_dropout: float = 0.0
     loss_type: str = "ce"      # "ce" (softmax cross-entropy) | "mse" (vs one-hot)
+    use_pos_enc: bool = True   # False -> skip adding the sinusoidal pos_enc in forward
     device: str = "cpu"
 
 
@@ -128,7 +129,8 @@ class ToyVanilla(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=1.0, std=0.02)
+            #torch.nn.init.ones_(module.weight)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
@@ -159,7 +161,10 @@ class ToyVanilla(nn.Module):
     def forward(self, idx, targets=None):
         b, t = idx.shape
         assert t <= self.config.block_size
-        x = self.drop(self.tok_emb(idx) + self.pos_enc[:t])
+        x = self.tok_emb(idx)
+        if self.config.use_pos_enc:
+            x = x + self.pos_enc[:t]
+        x = self.drop(x)
         for block in self.blocks:
             x = block(x)
         if targets is not None:

@@ -25,13 +25,13 @@ from dataclasses import fields, is_dataclass
 from .schema import (ExperimentConfig, ModelConfig, DataConfig, OptimConfig,
                      LRConfig, TrainConfig, AnalyzeConfig)
 from .presets import EXPERIMENTS, DEFAULT, get
-from .build import build_optimizer, make_lr_fn
+from .build import build_optimizer, make_lr_fn, freeze_submodules
 
 __all__ = [
     "ExperimentConfig", "ModelConfig", "DataConfig", "OptimConfig",
     "LRConfig", "TrainConfig", "AnalyzeConfig",
     "EXPERIMENTS", "DEFAULT", "load", "apply_overrides",
-    "build_optimizer", "make_lr_fn",
+    "build_optimizer", "make_lr_fn", "freeze_submodules",
 ]
 
 
