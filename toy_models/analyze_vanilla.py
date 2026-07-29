@@ -325,12 +325,17 @@ def main():
         model = get_model(tag)
         nh = NeuronHessian(model, get_batch, n_batches=n_batches, device=device)
         print(f"[rank {rank}] {tag}/{disp} ({kind}) ...", flush=True)
+        # 0-layer models admit the EXACT embedding Hessian (Gauss-Newton);
+        # the empirical-Fisher fallback is rank-1 per token and its JS distance
+        # hides the frequency heterogeneity (see recompute_embedding_hetero.py).
+        emb_method = "gn" if model_cfg.n_layer == 0 else "fisher"
         analyze_layer(nh, out_dir, tag, disp, kind, kwargs,
                       model_cfg.n_head, model_cfg.head_dim,
                       max_classes=max_classes, max_tokens=max_tokens,
                       num_bins=num_bins, device=device,
                       class_ids=CLASS_IDS, token_ids=TOKEN_IDS,
-                      loss_type=model_cfg.loss_type)
+                      loss_type=model_cfg.loss_type,
+                      emb_method=emb_method)
 
     if is_ddp:
         dist.barrier()

@@ -44,6 +44,10 @@ class ModelConfig:
     #   "mse" -> mean-squared error between logits and the one-hot target
     #            vector (ignore_index=-1 positions are still dropped)
     loss_type: str = "ce"
+    # sinusoidal position encoding (vanilla_model only): False -> forward skips
+    # adding pos_enc, making the 0-layer model position-independent like
+    # simpliest_model while keeping the vanilla_model class / ckpt loading path.
+    use_pos_enc: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +75,23 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class OptimConfig:
-    name: str = "sgd"                       # "sgd" | "adamw" | "adam"
+    name: str = "sgd"                       # "sgd" | "adamw" | "adam" | "muon"
     weight_decay: float = 0.1
     momentum: float = 0.9                   # SGD momentum
     nesterov: bool = False                  # SGD nesterov
-    betas: Tuple[float, float] = (0.9, 0.95)  # Adam(W) betas
+    betas: Tuple[float, float] = (0.9, 0.95)  # Adam(W) betas; also Muon's aux-AdamW betas
     eps: float = 1e-8                       # Adam(W) epsilon
     grad_clip: float = 1.0                  # 0 disables gradient clipping
+    # ---- Muon, Moonlight version (hidden 2D weight matrices; everything else
+    # ---- falls back to an internal AdamW group -- see build.Muon) ----
+    muon_momentum: float = 0.95             # momentum of the orthogonalized update
+    muon_nesterov: bool = True
+    muon_ns_steps: int = 5                  # Newton-Schulz iterations
+    # LR of the aux AdamW group = scheduled lr * this scale. The Moonlight
+    # update is RMS-matched to AdamW (0.2*sqrt(max(d_out,d_in)) scaling), so
+    # both groups share the same lr by default; keep 1.0 unless deliberately
+    # decoupling the embeds/head LR.
+    muon_aux_lr_scale: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +115,14 @@ class TrainConfig:
     eval_iters: int = 100
     log_interval: int = 20
     seed: int = 1337
+    # comma-separated submodule names to freeze at init (requires_grad=False
+    # on all their params, set BEFORE the DDP wrap and the optimizer build so
+    # DDP's reducer skips them and build_optimizer never sees them). Names are
+    # resolved with model.get_submodule, so dotted paths work too:
+    #   --train.freeze=lm_head              # head only
+    #   --train.freeze=lm_head,tok_emb      # head + embedding
+    #   --train.freeze=blocks.0             # a whole block
+    freeze: str = ""
     # sub-directory name under toy_models/runs/ for checkpoints + loss curve
     run_name: str = "vanilla_imbalance_s1-sgd"
     # checkpoint at these fractions of training; keys are the tags used as
@@ -174,4 +196,5 @@ class ExperimentConfig:
             head_dim=m.head_dim, n_ffn=m.n_ffn, n_layer=m.n_layer,
             block_type=m.block_type, block_size=m.block_size, dropout=m.dropout,
             attn_dropout=m.attn_dropout, loss_type=m.loss_type,
+            use_pos_enc=m.use_pos_enc,
         )
