@@ -68,7 +68,7 @@ NPROC_PER_NODE = 8
 # phase so they all resolve the same run_name / files_name / ckpt schedule.
 #   e.g. EXP_ARGS = "imbalance_s1_adamw"
 #        EXP_ARGS = "imbalance_s1_adamw --analyze.slq=true"
-EXP_ARGS = "mlp10_adamw-balance"       # applied to ALL phases
+EXP_ARGS = "mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G"       # applied to ALL phases
 
 # resolve the config locally to read the analyze.slq switch (and echo paths);
 # the job re-resolves the same tokens on the cluster.
@@ -84,10 +84,18 @@ PHASES = ["train_vanilla_transformer.py", "analyze_vanilla.py"]
 if _cfg.analyze.slq:
     PHASES.append("analyze_full_spectrum.py")
 
+# per-frequency-group class-loss curves from the saved ckpts (single process,
+# seconds on GPU). Runs right after training so the figure exists even if the
+# Hessian phase dies; dual-stream-only, but the script skips non-dual-stream
+# datasets (fineweb) gracefully with exit code 0, so it is safe to always run.
+_EVAL_BY_FREQ = (f"{ENV_PYTHON} -u eval_ckpts_val_by_freq.py "
+                 f"{_cfg.train.run_name} --batch_size=64")
+
 COMMAND = (
     f"cd {WORK_DIR} && "
     f"export PATH={CONDA_ENV_PATH}/bin:$PATH && "
-    + " && ".join(_launch(s) for s in PHASES)
+    + " && ".join([_launch(PHASES[0]), _EVAL_BY_FREQ]
+                  + [_launch(s) for s in PHASES[1:]])
 )
 # =======================================================================
 
@@ -136,7 +144,8 @@ def main() -> None:
     print(f"Files dir:  files/{_cfg.analyze.files_name}")
     print(f"DDP:        torchrun, {NPROC_PER_NODE} GPUs x {WORKER_NODES} node(s)")
     slq = "  ->  (3) full-parameter SLQ" if _cfg.analyze.slq else ""
-    print(f"Phases:     (1) DDP train  ->  (2) per-unit Hessian analysis{slq}")
+    print(f"Phases:     (1) DDP train  ->  (1b) class-loss-by-freq eval"
+          f"  ->  (2) per-unit Hessian analysis{slq}")
     if not args.yes:
         if input("Continue? (y/n): ").strip().lower() != "y":
             print("Cancelled.")
