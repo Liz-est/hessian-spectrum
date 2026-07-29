@@ -37,9 +37,16 @@ Per token, lm_head (MSE-vs-one-hot, exact):  loss = mean over N*C of
   vocab size (every class contributes to the mean, even un-selected ones).
 
 Per token, embedding (Fisher):  token id v owns embedding row e_v in R^d,
-    H_v = (1/N_v) sum_{t: x_t=v} g_t g_t^T             (d x d)
+    H_v = (1/N) sum_{t: x_t=v} g_t g_t^T               (d x d)
   g_t = dL/d(embedding output at position t); accumulated over the positions
-  where token v actually appears.
+  where token v actually appears. The denominator is the GLOBAL token count N
+  (all positions in the analysis batches), NOT the per-token count N_v -- this
+  is the true diagonal block of the *mean* training loss, whose magnitude scales
+  with frequency as N_v/N (frequent tokens -> larger curvature blocks). Dividing
+  by N_v instead would give the per-occurrence average curvature, a
+  frequency-controlled probe that erases exactly the frequency heterogeneity the
+  optimizer actually feels; it would also make embedding the only block not
+  normalized like the others (neuron / lm_head both divide by the global N).
 
 For each layer we get one block per unit, eigendecompose each, and:
   (1) pool eigenvalues over units  -> ESD (spectrum) plot;
@@ -277,6 +284,7 @@ class NeuronHessian:
         lut[sel] = torch.arange(n_sel, device=self.device)
         Hsum = torch.zeros((n_sel, d, d), dtype=torch.float64, device=self.device)
         cnt = torch.zeros(n_sel, dtype=torch.float64, device=self.device)
+        n_tok = 0                       # GLOBAL position count (all tokens seen)
 
         store = {}
         def fhook(mod, inp, out):
@@ -292,17 +300,119 @@ class NeuronHessian:
             loss.backward()
             ids = store["ids"].reshape(-1)                                # (N,)
             g = store["out"].grad.reshape(-1, d).to(torch.float64)       # (N,d)
+            n_tok += ids.numel()                     # count EVERY position, not
+                                                     # just the selected tokens
             slot = lut[ids]
             mask = slot >= 0
             slot = slot[mask]; g = g[mask]
-            # accumulate g g^T into the block of each selected token (index_add)
-            outer = torch.einsum("ni,nj->nij", g, g)                     # (N,d,d)
-            Hsum.index_add_(0, slot, outer)
+            # accumulate sum_t g_t g_t^T per selected token, computed as G_v^T G_v
+            # over that token's rows -- identical to summing outer products but
+            # without ever materializing the (N,d,d) tensor (huge for large N,d).
+            for u in torch.unique(slot):
+                gv = g[slot == u]                                        # (N_v,d)
+                Hsum[u] += gv.t() @ gv
             cnt.index_add_(0, slot, torch.ones_like(slot, dtype=torch.float64))
         h.remove()
         self.model.zero_grad(set_to_none=True)
-        denom = cnt.clamp_min(1.0).view(n_sel, 1, 1)
-        Hsum /= denom
+        # true mean-loss block: divide by the GLOBAL token count, so the block
+        # magnitude keeps its N_v/N frequency scaling (same normalization as
+        # neuron_blocks / last_layer_blocks). cnt is still returned so callers
+        # can report how many distinct tokens were actually seen.
+        Hsum /= max(1, n_tok)
+        eigs = np.stack([torch.linalg.eigvalsh(Hsum[v]).cpu().numpy() for v in range(n_sel)])
+        return eigs, cnt.cpu().numpy()
+
+    # ---- embedding: EXACT Hessian block per token id (0-layer models only) ----
+    def token_embedding_gn_blocks(self, emb_path="tok_emb", head_path="lm_head",
+                                  max_tokens=None, token_ids=None, loss_type="ce"):
+        """Exact per-token Hessian block of the embedding row e_v, valid ONLY for
+        0-layer models (emb_out -> logits is z = W e_v + b, i.e. LINEAR in e_v, so
+        the exact Hessian equals the Gauss-Newton block -- the residual term
+        vanishes). W = lm_head.weight (C,d).
+
+            H_v = (1/N) sum_{t: x_t=v} J_t^T (d^2 L / d z_t^2) J_t
+                = (1/N) sum_{t: x_t=v} W^T S_t W                       (d x d)
+
+          MSE-vs-one-hot:  d^2L/dz^2 = (2/C) I  (constant, position-independent),
+            so H_v = (N_v/N) * (2/C) * W^T W  -- rank d, one shared matrix scaled
+            by the token frequency N_v/N.
+          CE:  S_t = diag(p_t) - p_t p_t^T with p_t = softmax(z_t); p_t depends on
+            the position (via the added positional encoding), so we accumulate
+            W^T S_t W over the positions where token v appears.
+
+        Unlike token_embedding_blocks (empirical Fisher, g g^T), this is the TRUE
+        curvature: for a frozen all-ones head the Fisher block collapses to rank 1
+        while this GN block is full rank. Verified against torch.autograd Hessian
+        to ~1e-15 (MSE) / ~1e-16 (CE)."""
+        emb = self._module(emb_path)
+        head = self._module(head_path)
+        V_full = emb.num_embeddings
+        d = emb.embedding_dim
+        W = head.weight.detach().to(torch.float64)                    # (C,d)
+        C_full = W.shape[0]
+        if token_ids is not None:
+            sel = torch.as_tensor(np.asarray(token_ids), dtype=torch.long,
+                                  device=self.device)
+        else:
+            V = V_full if max_tokens is None else min(V_full, max_tokens)
+            sel = torch.arange(V, device=self.device)
+        n_sel = sel.numel()
+        lut = torch.full((V_full,), -1, dtype=torch.long, device=self.device)
+        lut[sel] = torch.arange(n_sel, device=self.device)
+        cnt = torch.zeros(n_sel, dtype=torch.float64, device=self.device)
+        n_tok = 0
+
+        # MSE: curvature is constant (2/C) I, so H_v = (N_v/N)(2/C) W^T W. We only
+        # need per-token counts -- no logits, one shared matrix.
+        if loss_type == "mse":
+            WtW = (W.t() @ W).to(self.device)                          # (d,d)
+            store = {}
+            def fhook(mod, inp, out):
+                store["ids"] = inp[0].detach()
+            h = emb.register_forward_hook(fhook)
+            self.model.eval()
+            with torch.no_grad():
+                for _ in range(self.n_batches):
+                    X, Y = self.get_batch()
+                    self.model(X, Y)
+                    ids = store["ids"].reshape(-1)
+                    n_tok += ids.numel()
+                    slot = lut[ids]; slot = slot[slot >= 0]
+                    cnt.index_add_(0, slot, torch.ones_like(slot, dtype=torch.float64))
+            h.remove()
+            base = (2.0 / C_full) * WtW                                # shared (d,d)
+            wbase = torch.linalg.eigvalsh(base).cpu().numpy()          # (d,)
+            scale = (cnt / max(1, n_tok)).cpu().numpy()                # (n_sel,) = N_v/N
+            eigs = scale[:, None] * wbase[None, :]                     # (n_sel,d)
+            return eigs, cnt.cpu().numpy()
+
+        # CE: S_t = diag(p_t) - p_t p_t^T depends on the position -> accumulate
+        # W^T S_t W = (W^T diag(p) W) - (W^T p)(W^T p)^T per selected token.
+        Hsum = torch.zeros((n_sel, d, d), dtype=torch.float64, device=self.device)
+        store = {}
+        def fhook(mod, inp, out):
+            store["ids"] = inp[0].detach()
+        h = emb.register_forward_hook(fhook)
+        self.model.eval()
+        with torch.no_grad():
+            for _ in range(self.n_batches):
+                X, Y = self.get_batch()
+                logits, _ = self.model(X, Y)
+                ids = store["ids"].reshape(-1)                        # (N,)
+                n_tok += ids.numel()
+                P = F.softmax(logits.reshape(-1, logits.size(-1)), dim=-1).to(torch.float64)  # (N,C)
+                slot = lut[ids]
+                mask = slot >= 0
+                slot = slot[mask]; P = P[mask]
+                for u in torch.unique(slot):
+                    Pu = P[slot == u]                                 # (N_v,C)
+                    # sum_t W^T diag(p_t) W  =  W^T diag(sum_t p_t) W
+                    WtDW = W.t() @ (Pu.sum(0).unsqueeze(1) * W)        # (d,d)
+                    q = Pu @ W                                        # (N_v,d) = W^T p_t rows
+                    Hsum[u] += WtDW - q.t() @ q
+                cnt.index_add_(0, slot, torch.ones_like(slot, dtype=torch.float64))
+        h.remove()
+        Hsum /= max(1, n_tok)
         eigs = np.stack([torch.linalg.eigvalsh(Hsum[v]).cpu().numpy() for v in range(n_sel)])
         return eigs, cnt.cpu().numpy()
 
@@ -432,8 +542,16 @@ def default_layer_spec(n_head, head_dim, n_layer=1, block_type="transformer"):
 
 def compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
                        max_classes=256, max_tokens=256,
-                       class_ids=None, token_ids=None, loss_type="ce"):
-    """Dispatch to the right blocking routine, return (eigs, meta)."""
+                       class_ids=None, token_ids=None, loss_type="ce",
+                       emb_method="fisher"):
+    """Dispatch to the right blocking routine, return (eigs, meta).
+
+    emb_method selects how the embedding ("token") block is formed:
+      * "fisher" -> empirical Fisher sum_t g_t g_t^T (works for any depth).
+      * "gn"     -> EXACT Hessian = Gauss-Newton, ONLY valid for 0-layer models
+                    (emb -> logits linear). Full rank; reveals the frequency
+                    (N_v/N) scaling that the rank-deficient Fisher block hides.
+    """
     if kind == "class":
         eigs = nh.last_layer_blocks(kwargs["path"], max_classes=max_classes,
                                     class_ids=class_ids, loss_type=loss_type)
@@ -442,9 +560,15 @@ def compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
             meta["token_select"] = "freq"
         return eigs, meta
     if kind == "token":
-        eigs, cnt = nh.token_embedding_blocks(kwargs["path"], max_tokens=max_tokens,
-                                              token_ids=token_ids)
-        meta = {"unit": "token", "n_seen": int((cnt > 0).sum())}
+        if emb_method == "gn":
+            eigs, cnt = nh.token_embedding_gn_blocks(
+                kwargs["path"], max_tokens=max_tokens, token_ids=token_ids,
+                loss_type=loss_type)
+        else:
+            eigs, cnt = nh.token_embedding_blocks(kwargs["path"], max_tokens=max_tokens,
+                                                  token_ids=token_ids)
+        meta = {"unit": "token", "n_seen": int((cnt > 0).sum()),
+                "emb_method": emb_method, "_cnt": cnt}
         if token_ids is not None:
             meta["token_select"] = "freq"
         return eigs, meta
@@ -462,15 +586,20 @@ def compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
 # ----------------------------------------------------------------------------
 def analyze_layer(nh, out_dir, tag, disp, kind, kwargs, n_head, head_dim,
                   max_classes=256, max_tokens=256, num_bins=64, device="cpu",
-                  class_ids=None, token_ids=None, loss_type="ce"):
+                  class_ids=None, token_ids=None, loss_type="ce",
+                  emb_method="fisher"):
     save_dir = os.path.join(out_dir, tag)
     os.makedirs(save_dir, exist_ok=True)
 
     eigs, meta = compute_layer_eigs(nh, kind, kwargs, n_head, head_dim,
                                     max_classes=max_classes, max_tokens=max_tokens,
                                     class_ids=class_ids, token_ids=token_ids,
-                                    loss_type=loss_type)
+                                    loss_type=loss_type, emb_method=emb_method)
     np.save(os.path.join(save_dir, f"eigs_{disp}.npy"), eigs)
+    # per-token occurrence counts (embedding only) -> for curvature-vs-freq plots
+    cnt = meta.pop("_cnt", None)
+    if cnt is not None:
+        np.save(os.path.join(save_dir, f"counts_{disp}.npy"), cnt)
 
     edges = common_log_edges(eigs, num_bins)
     P = spectra_to_prob(eigs, edges)
