@@ -39,6 +39,18 @@ _MODEL_EMBED_HEAD_MSE = ModelConfig(
     n_ffn=1024, n_layer=0, block_size=128, loss_type="mse",
 )
 
+# same as _MODEL_EMBED_HEAD_MSE but with the sinusoidal pos_enc disabled
+# (use_pos_enc=False -> vanilla_model.forward skips the pos_enc add), so the
+# 0-layer model is purely token->logits with no position dependence. Removes
+# the Var_t(sum pe[t]) ~= 109 irreducible-loss floor seen in the frozen-lm_head
+# (all-ones, rank-1) runs, where every class shares one logit and the position
+# term cannot be cancelled per position.
+_MODEL_EMBED_HEAD_MSE_POS0 = ModelConfig(
+    vocab_size=1024, n_embd=192, n_head=6, head_dim=32,
+    n_ffn=1024, n_layer=0, block_size=128, loss_type="mse",
+    use_pos_enc=False,
+)
+
 _MODEL_l5_MSE = ModelConfig(
     vocab_size=1024, n_embd=192, n_head=6, head_dim=32,
     n_ffn=1024, n_layer=5, block_size=128, loss_type="mse",
@@ -673,6 +685,280 @@ EXPERIMENTS = {
         train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-muon",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-muon"),
+    ),
+
+#------------------------Freeze Test(delete the position encoding)-----------------------------------
+# linear model (only embedding + lm_head) + mes loss + imbalance data (initialize = 1)
+    # ---------freeze embedding + SGD lr = 0.1---------------------------
+    "mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G": ExperimentConfig(
+        name="mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.1, min_lr=0.005,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=8000, run_name="mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G"),
+    ),
+    # ---------freeze embedding + AdamW lr = 1.5e-3--------------------------
+    "mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G": ExperimentConfig(
+        name="mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-3, min_lr=0.075e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=8000, run_name="mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G"),
+    ),
+
+    # ---------freeze lm_head + SGD lr = 0.05------------------------------
+    "mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.05, min_lr=0.0025,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G"),
+    ),
+
+    # ---------freeze lm_head + AdamW lr = 1.5e-3----------------------------
+    "mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-3, min_lr=0.075e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G"),
+    ),
+
+        # ---------freeze lm_head + AdamW lr = 1.5e-2----------------------------
+    "mse0-pos0-frozen_lmhead-adamw-lr1p5e-2-imb-init1G": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-2-imb-init1G",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-2, min_lr=0.075e-2,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-2-imb-init1G",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-2-imb-init1G"),
+    ),
+
+            # ---------freeze lm_head + AdamW lr = 2e-3----------------------------
+    "mse0-pos0-frozen_lmhead-adamw-lr2e-3-imb-init1G": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-adamw-lr2e-3-imb-init1G",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=2e-3, min_lr=0.1e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0-pos0-frozen_lmhead-adamw-lr2e-3-imb-init1G",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-adamw-lr2e-3-imb-init1G"),
+    ),
+    # -----------------------------1500 iter------------------------------------
+    # ---------freeze embedding + SGD lr = 0.1---------------------------
+    "mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.1, min_lr=0.005,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=1500, run_name="mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_embd-sgd-lr0p1-imb-init1G-iter1500"),
+    ),
+    # ---------freeze embedding + AdamW lr = 1.5e-3--------------------------
+    "mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-3, min_lr=0.075e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=1500, run_name="mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_embd-adamw-lr1p5e-3-imb-init1G-iter1500"),
+    ),
+
+    # ---------freeze lm_head + SGD lr = 0.05------------------------------
+    "mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.05, min_lr=0.0025,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=1500, run_name="mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G-iter1500"),
+    ),
+
+    # ---------freeze lm_head + AdamW lr = 1.5e-3----------------------------
+    "mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-3, min_lr=0.075e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=1500, run_name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G-iter1500"),
+    ),
+
+        # ---------freeze lm_head + AdamW lr = 6e-3----------------------------
+    "mse0-pos0-frozen_lmhead-adamw-lr6e-3-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-adamw-lr6e-3-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-3, min_lr=3e-4,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=1500, run_name="mse0-pos0-frozen_lmhead-adamw-lr6e-3-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-adamw-lr6e-3-imb-init1G-iter1500"),
+    ),
+
+            # ---------freeze embedding + AdamW lr = 6e-3----------------------------
+    "mse0-pos0-frozen_embd-adamw-lr6e-3-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_embd-adamw-lr6e-3-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=6e-3, min_lr=3e-4,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=1500, run_name="mse0-pos0-frozen_embd-adamw-lr6e-3-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_embd-adamw-lr6e-3-imb-init1G-iter1500"),
+    ),
+
+            # ---------freeze lm_head + AdamW lr = 9e-3----------------------------
+    "mse0-pos0-frozen_lmhead-adamw-lr9e-3-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_lmhead-adamw-lr9e-3-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=9e-3, min_lr=4.5e-4,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=1500, run_name="mse0-pos0-frozen_lmhead-adamw-lr9e-3-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_lmhead-adamw-lr9e-3-imb-init1G-iter1500"),
+    ),
+
+            # ---------freeze embedding + AdamW lr = 9e-3----------------------------
+    "mse0-pos0-frozen_embd-adamw-lr9e-3-imb-init1G-iter1500": ExperimentConfig(
+        name="mse0-pos0-frozen_embd-adamw-lr9e-3-imb-init1G-iter1500",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=9e-3, min_lr=4.5e-4,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=1500, run_name="mse0-pos0-frozen_embd-adamw-lr9e-3-imb-init1G-iter1500",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0-pos0-frozen_embd-adamw-lr9e-3-imb-init1G-iter1500"),
+    ),
+
+#------------------------Freeze Test-----------------------------------
+# linear model (only embedding + lm_head) + mes loss + imbalance data (initialize = 1)
+    # ---------freeze embedding + SGD---------------------------
+    "mse0-frozen_embd-sgd-imbalance": ExperimentConfig(
+        name="mse0-frozen_embd-sgd-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.1, min_lr=0.005,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=8000, run_name="mse0_frozen_embd-sgd-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_embd-sgd-imbalance"),
+    ),
+    # ---------freeze embedding + AdamW--------------------------
+    "mse0-frozen_embd-adamw-imbalance": ExperimentConfig(
+        name="mse0-frozen_embd-adamw-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-4, min_lr=0.075e-4,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=8000, run_name="mse0_frozen_embd-adamw-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_embd-adamw-imbalance"),
+    ),
+
+    # ---------freeze lm_head + SGD lr0.1------------------------------
+    "mse0-frozen_lmhead-sgd-lr0p1-imbalance": ExperimentConfig(
+        name="mse0-frozen_lmhead-sgd-lr0p1-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.1, min_lr=0.005,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0_frozen_lmhead-sgd-lr0p1-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_lmhead-sgd-lr0p1-imbalance"),
+    ),
+
+    # ---------freeze lm_head + SGD lr = 0.05------------------------------
+    "mse0-frozen_lmhead-sgd-lr0p05-imbalance": ExperimentConfig(
+        name="mse0-frozen_lmhead-sgd-lr0p05-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="sgd", momentum=0.9, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=0.05, min_lr=0.0025,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0_frozen_lmhead-sgd-lr0p05-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_lmhead-sgd-lr0p05-imbalance"),
+    ),
+
+    # ---------freeze lm_head + AdamW----------------------------
+    "mse0-frozen_lmhead-adamw-imbalance": ExperimentConfig(
+        name="mse0-frozen_lmhead-adamw-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-4, min_lr=0.075e-4,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0_frozen_lmhead-adamw-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_lmhead-adamw-imbalance"),
+    ),
+
+    # ---------freeze embedding + AdamW lr = 1.5e-3--------------------------
+    "mse0-frozen_embd-adamw-lr1p5e-3-imbalance": ExperimentConfig(
+        name="mse0-frozen_embd-adamw-lr1p5e-3-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-3, min_lr=0.075e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="tok_emb", max_iters=8000, run_name="mse0_frozen_embd-adamw-lr1p5e-3-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_embd-adamw-lr1p5e-3-imbalance"),
+    ),
+
+    # ---------freeze lm_head + AdamW lr = 1.5e-3----------------------------
+    "mse0-frozen_lmhead-adamw-lr1p5e-3-imbalance": ExperimentConfig(
+        name="mse0-frozen_lmhead-adamw-lr1p5e-3-imbalance",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE),
+        data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
+        optim=OptimConfig(name="adamw", betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, grad_clip=0),
+        lr=LRConfig(scheduler="cosine", learning_rate=1.5e-3, min_lr=0.075e-3,
+                    warmup_iters=200),
+        train=TrainConfig(freeze="lm_head", max_iters=8000, run_name="mse0_frozen_lmhead-adamw-lr1p5e-3-imbalance",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="mse0_frozen_lmhead-adamw-lr1p5e-3-imbalance"),
     ),
 
 }
