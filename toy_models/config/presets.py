@@ -90,7 +90,7 @@ _MODEL_fw10B_l20 = ModelConfig(
 )
 
 # 1-layer variant, matching the legacy pre-preset run vanilla_fineweb10B-adamw
-# (train_vanilla_transformer_fineweb10B.py: same shape, n_layer=1).
+# (same shape, n_layer=1).
 _MODEL_fw10B_l1 = ModelConfig(
     vocab_size=50304, n_embd=192, n_head=6, head_dim=32,
     n_ffn=1024, n_layer=1, block_size=1024,
@@ -528,9 +528,9 @@ EXPERIMENTS = {
 
 
 #   ------------------------- fineweb10B: 5-layer/20 layer transformer on REAL data -----------
-#   GPT-2 BPE (vocab 50304), 1024-token context, AdamW. Training budget follows
-#   train_vanilla_transformer_fineweb10B.py (20k iters, bs=32, warmup=400,
-#   lr 6e-4 -> 6e-5). Data lives in <repo-root>/data/fineweb10B/ as modded-nanoGPT
+#   GPT-2 BPE (vocab 50304), 1024-token context, AdamW. Training budget: 20k iters,
+#   bs=32, warmup=400, lr 6e-4 -> 6e-5. Data lives in <repo-root>/data/fineweb10B/
+#   as modded-nanoGPT
 #   single-stream shards, so format="nanogpt_shards". 9-checkpoint schedule.
 
     "layer5-fineweb10B-adamw": ExperimentConfig(
@@ -685,6 +685,39 @@ EXPERIMENTS = {
         train=TrainConfig(max_iters=8000, run_name="layer5-mse-imbalance-s1-muon",
                           ckpt_fracs=dict(_CKPT_9)),
         analyze=AnalyzeConfig(files_name="layer5-mse-imbalance-s1-muon"),
+    ),
+
+#------------------------FULL-BATCH: GD vs Adam (train_fullbatch.py)-----------------------------
+# embed + lm_head MSE model WITHOUT pos_enc (_MODEL_EMBED_HEAD_MSE_POS0) on the
+# shuffled-marginals data from build_shuffled_dataset.py (100k train pairs =
+# the full batch). data.batch_size is the gradient-accumulation MICRO-batch,
+# not a sampling batch. Deterministic-dynamics choices: momentum=0 (plain GD),
+# weight_decay=0, grad_clip=0, constant lr with no warmup.
+    # --------- full-batch GD ---------------------------
+    "fullbatch-mse0-shuffled-gd": ExperimentConfig(
+        name="fullbatch-mse0-shuffled-gd",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_shuffled_x1_y0_100k_V1024", batch_size=64),
+        # lr from the 40-iter SCO smoke sweep (2026-07-29): 0.1 -> NaN by iter
+        # 10; 1e-3 is stable and the fastest of {1e-3, 3e-4, 1e-4, 1e-5, 1e-6}.
+        optim=OptimConfig(name="sgd", momentum=0.0, weight_decay=0.0, grad_clip=0),
+        lr=LRConfig(scheduler="constant", learning_rate=1e-3, warmup_iters=0),
+        train=TrainConfig(max_iters=8000, run_name="fullbatch-mse0-shuffled-gd",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="fullbatch-mse0-shuffled-gd"),
+    ),
+
+    # --------- full-batch Adam -------------------------
+    "fullbatch-mse0-shuffled-adam": ExperimentConfig(
+        name="fullbatch-mse0-shuffled-adam",
+        model=copy.deepcopy(_MODEL_EMBED_HEAD_MSE_POS0),
+        data=DataConfig(dataset="synth_shuffled_x1_y0_100k_V1024", batch_size=64),
+        optim=OptimConfig(name="adam", betas=(0.9, 0.95), eps=1e-8,
+                          weight_decay=0.0, grad_clip=0),
+        lr=LRConfig(scheduler="constant", learning_rate=1.5e-3, warmup_iters=0),
+        train=TrainConfig(max_iters=8000, run_name="fullbatch-mse0-shuffled-adam",
+                          ckpt_fracs=dict(_CKPT_9)),
+        analyze=AnalyzeConfig(files_name="fullbatch-mse0-shuffled-adam"),
     ),
 
 #------------------------Freeze Test(delete the position encoding)-----------------------------------

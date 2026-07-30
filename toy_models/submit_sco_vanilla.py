@@ -11,7 +11,7 @@ Usage (from the hessian-spectrum repo):
 
 Notes
 -----
-* Mirrors language_models/submit_sco.py (same platform params / env).
+* Mirrors submit_sco_simpliest.py (same platform params / env).
 * The container only mounts /data, so the repo, conda env, and dataset are all
   referenced by their /data paths (valid both on this dev box and in the job).
 * All experiment settings come from the config package (toy_models/config/).

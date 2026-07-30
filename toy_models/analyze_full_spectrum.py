@@ -3,8 +3,8 @@ Full-parameter Hessian ESD via stochastic Lanczos quadrature (SLQ).
 
 Unlike analyze_vanilla.py (per-unit block spectra, block-diagonal view), this
 computes the spectral density of the FULL Hessian of the loss w.r.t. the whole
-parameter vector -- cross-block curvature included -- following the method of
-language_models/hessian_spectrum.py (paper arXiv 2402.16788), with two
+parameter vector -- cross-block curvature included -- following the SLQ method
+of the paper's original implementation (arXiv 2402.16788), with two
 accuracy upgrades that the tiny toy models afford:
 
   * fp64 end-to-end: the model is cast to double and the HVP / Lanczos

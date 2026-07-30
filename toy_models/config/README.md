@@ -39,8 +39,8 @@ train/analyze 链，Hessian 里 attn 槽按逐神经元（neuron）分块。
 modded-nanoGPT 的单流 shard 格式（每个 `fineweb_*.bin` 有 1024 字节 header + uint16 token
 流，target = 输入右移一位），因此 `DataConfig.format="nanogpt_shards"`；synth 双流数据
 （`train_x.bin`/`train_y.bin`）用默认的 `format="dual_stream"`。train/analyze 脚本按此字段
-选数据加载器，模型、优化器、Hessian 机器完全复用。训练预算沿用原
-`train_vanilla_transformer_fineweb10B.py`（20k iters，bs=32，warmup=400，lr 6e-4→6e-5）。
+选数据加载器，模型、优化器、Hessian 机器完全复用。训练预算：20k iters，bs=32，
+warmup=400，lr 6e-4→6e-5。
 
 `vanilla` 脚本默认 `imbalance_s1_sgd`,`simpliest` 脚本默认 `simpliest_sgd-imbalance`
 (见 `train_simpliest_model.py` / `analyze_simpliest.py` 顶部的 `load(...)`,改预设 key

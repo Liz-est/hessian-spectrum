@@ -370,14 +370,15 @@ meta.pkl      dict: vocab_size, pi, P, config, seed, label_mode, ...
 
 ## 接入训练代码
 
-`train_gpt2.py` 和 `hessian_spectrum.py` 已改造成**自动识别格式**、且**向后兼容**：
+GPT-2 侧的 `train_gpt2.py` 和 `hessian_spectrum.py`（现存于
+`language_models/test_data/`）已改造成**自动识别格式**、且**向后兼容**：
 
 - 若数据目录里存在 `train_x.bin` → 走双流，x/y 各自读，y 不做平移。
 - 否则 → 回退到旧的单流 `train.bin` + "平移一位"逻辑（openwebtext 等不受影响）。
 
-在 config 里把 `dataset` 指到你生成的目录名即可，例如
-`config/train_gpt2_small.py` 中设 `dataset = 'synth_zipf_imbalanced'`
-（数据目录相对 `language_models/data/`）。
+在 config 里把 `dataset` 指到你生成的目录名即可（数据目录解析为
+`../../data_construction/data/<dataset>`，相对 `test_data/`）。toy_models
+侧则由 preset 的 `data.dataset` / `data.format="dual_stream"` 指定。
 
 ## 让 output 独立于 input（`label_mode='independent'`，已实现）
 

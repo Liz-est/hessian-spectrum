@@ -29,11 +29,12 @@ toy_models/
 ├── simpliest_model.py           # ToyVanilla 变体：forward 不加位置编码；n_layer=0
 │                                #   即 embed+lmhead-only。⚠ 与 vanilla_model state_dict
 │                                #   相同但 forward 不同，load ckpt 必须按 run 名选类
-├── llama_model.py / llama_A.py / llama_B.py   # LLaMA-style 方案 A/B（仅参数量参考）
 ├── vanilla_transformer.py       # 方案 C 的 build()，直接运行打印参数量分解
 │
 ├── train_vanilla_transformer.py # 训练入口（torchrun DDP；写 ckpt + loss 曲线）
 ├── train_simpliest_model.py     # simpliest 系的训练入口
+├── train_fullbatch.py           # full-batch（整 train 分片为一个 batch）训练入口，
+│                                #   单进程无 DDP，梯度累积精确等于 full-batch 梯度
 │
 ├── hessian_toy.py               # 【库】精确 per-unit Hessian 块 + 特征分解 + hetero 距离
 ├── analyze_vanilla.py           # 【入口】逐单元块谱分析（依赖 hessian_toy）
@@ -41,17 +42,20 @@ toy_models/
 ├── analyze_full_spectrum.py     # 【入口】全参数 Hessian ESD（SLQ，自包含，不依赖 hessian_toy）
 │
 ├── eval_ckpts_val.py            # 对已有 run 的 ckpt 事后补算 val loss
+├── eval_ckpts_val_by_freq.py    # 按 target token 频率分组（10 组）的 val loss 曲线
 ├── compute_fineweb_token_freq.py# 生成 token_counts.npy（token_select="freq" 用）
 │
 ├── submit_sco_vanilla.py        # SCO 单 job 提交：训练 -> 块谱分析 [-> SLQ]（见下）
 ├── submit_sco_simpliest.py      # simpliest 系对应提交脚本
-├── sco_run_*.py                 # 各批次实验的参数写死的提交/排队编排器（历史存档）
+├── submit_sco_fullbatch.py      # full-batch 实验提交：单 job 8 GPU，每 GPU 一个
+│                                #   train_fullbatch.py 实验并行（非 torchrun）
 │
 ├── runs/<run_name>/             # 训练产物：ckpt_<tag>.pt、loss_log.csv、loss 曲线
+├── logs/<job_name>/             # SCO full-batch job 的 launch.sh + 各 run 日志
 └── files/<files_name>/          # 分析产物：块谱 + hetero 图；slq/ 子目录放全参数谱
 ```
 
-**入口 vs 库**：`train_*.py`、`analyze_*.py`、`eval_*.py`、`submit_*.py`、`sco_run_*.py`
+**入口 vs 库**：`train_*.py`、`analyze_*.py`、`eval_*.py`、`submit_*.py`
 是可执行入口；`hessian_toy.py`、`config/`、`*_model.py` 是被 import 的库，不直接运行。
 
 ## 配置体系与数据流
@@ -128,20 +132,6 @@ N_block       = 4d² + 2·d·d_ff + 9d + d_ff = 543,424   (每层)
 - **mlp10**：`block_type="mlp"`，5 个 block 的 attention 槽替换为第二个 FFN，
   即 10 个 FFN 子层、无 attention。
 - **mse0**：n_layer=0 + `loss_type="mse"`（one-hot 目标的 MSE，走 vanilla_model）。
-
-### 方案 A / B：LLaMA-style decoder（仅参数量参考，未在实验矩阵中使用）
-
-单层 RMSNorm + RoPE + SwiGLU、无 bias、untied，V=1024：
-
-| 配置 | A (llama_A) | B (llama_B) |
-| ---- | ----------: | ----------: |
-| `d` / `h` / `d_head` / `d_ff` | 160 / 5 / 32 / 448 | 256 / 4 / 64 / 680 |
-| 总参数量 | 0.646M | 1.309M |
-
-```
-N_embed+head  = 2·V·d
-N_transformer = 4d² + 3·d·d_ff + 3d
-```
 
 ---
 
@@ -296,6 +286,21 @@ python3 analyze_full_spectrum.py <preset>        # 若要全参数谱
 
 ```bash
 python3 eval_ckpts_val.py              # 对旧 run 的 ckpt 补算 val loss
+python3 eval_ckpts_val_by_freq.py      # 按 target token 频率分组的 val loss 曲线
 /root/.sco/bin/sco --profile zhanglixian-g acp jobs list \
     --workspace-name p10-intelligent-adaptation-and-optimization-for-domestic-ai   # 查 job
 ```
+
+### 写批量提交/排队脚本的教训（2026-07-27 postmortem）
+
+历史上曾有参数写死的批次编排器（`sco_run_mse0.py`，已删）。若将来再写这类脚本，
+三条经验必须保留：
+
+1. **job 名从 preset key 派生**，不要手写自由文本——曾出现 SGD preset 跑在
+   `-adamw` job 名下、且同批内重名。
+2. **轮询用 `pt-` job ID，绝不用 name**——`sco acp jobs list` 会留着早先提交的
+   同名 terminal job，name->state 字典会让旧的 FAILED/SUCCEEDED 行遮蔽新 run
+   （旧 SUCCEEDED 行还会让排队等待提前结束，破坏 two-at-a-time 队列）。
+3. **purge 目录前先 `config.load(preset)` 解析真实的 `run_name`/`files_name`**——
+   输出目录一般 ≠ preset key，按 key purge 可能静默 no-op，让 analyze 的
+   resume 逻辑跳过 stale 结果。
