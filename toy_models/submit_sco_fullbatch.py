@@ -73,7 +73,7 @@ N_GPUS = 8
 # valid inside the job container).
 REPO_ROOT = "/data/sunruoyu/wangsenmiao/Data-Imbalance-Hessian/hessian-spectrum-xinlurepo-senmiao"
 WORK_DIR = f"{REPO_ROOT}/toy_models"
-JOB_NAME = "fullbatch-gd-vs-adam-002"   # change per run, keep unique
+JOB_NAME = "fullbatch-gd-vs-adam-2p17-001"   # change per run, keep unique
 
 # Python environment, by absolute path (no conda activation needed).
 # Uses this user's own miniconda3 -- the older toy_models submitters point at
@@ -90,13 +90,13 @@ ENV_PYTHON = f"{CONDA_ENV_PATH}/bin/python"
 # IMPORTANT: entries sharing a preset MUST override --train.run_name (and
 # --analyze.files_name if analyzed later) or they write into the same runs/ dir.
 RUNS = [
-    "fullbatch-mse0-shuffled-gd",
-    "fullbatch-mse0-shuffled-adam",
+    "fullbatch-mse0-shuffled-2p17-gd",
+    "fullbatch-mse0-shuffled-2p17-adam",
     # --- lr sweep examples to fill the remaining GPUs -----------------
-    # "fullbatch-mse0-shuffled-gd --lr.learning_rate=3e-3"
-    #     " --train.run_name=fullbatch-mse0-shuffled-gd-lr3e-3",
-    # "fullbatch-mse0-shuffled-adam --lr.learning_rate=3e-3"
-    #     " --train.run_name=fullbatch-mse0-shuffled-adam-lr3e-3",
+    # "fullbatch-mse0-shuffled-2p17-gd --lr.learning_rate=3e-3"
+    #     " --train.run_name=fullbatch-mse0-shuffled-2p17-gd-lr3e-3",
+    # "fullbatch-mse0-shuffled-2p17-adam --lr.learning_rate=3e-3"
+    #     " --train.run_name=fullbatch-mse0-shuffled-2p17-adam-lr3e-3",
 ]
 # =======================================================================
 

@@ -2,7 +2,8 @@
 vanilla_transformer: single-layer vanilla decoder-only Transformer (方案 C).
 
 Config: d=192, h=6, d_head=32, d_ff=1024, V=1024, context=128.
-Post-LayerNorm, ReLU FFN, fixed sinusoidal PE, linear bias on, embed/head untied.
+Pre-RMSNorm with final RMSNorm, ReLU FFN, fixed sinusoidal PE, no Linear bias,
+embed/head untied.
 """
 
 from vanilla_model import ToyVanilla, ToyVanillaConfig
@@ -37,5 +38,5 @@ if __name__ == "__main__":
     row("Embedding + LM Head", "embed+head")
     row("Self-attention", "self_attention")
     row("FFN", "ffn")
-    row("LayerNorm", "layernorm")
+    row("Normalization", "layernorm")
     row("Transformer body", "transformer")

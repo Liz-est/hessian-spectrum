@@ -2,15 +2,15 @@
 Zero-layer vanilla decoder-only Transformer for toy experiments.
 
 Design choices (match the param-counting formulas in the README):
-  - Post-LayerNorm (weight + bias)          -> 2 LN/block, each 2d = 4d params
+  - Pre-RMSNorm block definition             -> scale only, no affine bias
   - Fixed sinusoidal position encoding       -> no trainable position params
-  - Multi-head causal self-attention (bias)  -> 4 d^2 + 4d
-  - FFN: Linear-ReLU-Linear (bias)           -> 2 d*d_ff + d_ff + d
-  - LM Head with bias, NOT tied to embedding -> V*d + V
+  - Multi-head causal self-attention          -> no Linear bias
+  - FFN: Linear-ReLU-Linear                   -> no Linear bias
+  - LM Head, NOT tied to embedding            -> no Linear bias
   - Token embedding                          -> V*d
 
-Parameter counts (single layer, bias on):
-  N_embed+head  = 2*V*d + V
+Parameter counts:
+  N_embed+head  = 2*V*d
 """
 
 import math
@@ -32,6 +32,8 @@ class ToyVanillaConfig:
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
+    linear_bias: bool = False
+    norm_eps: float = 1e-6
     device: str = "cpu"
 
 
@@ -46,6 +48,18 @@ def sinusoidal_encoding(seqlen, dim, device):
     return pe
 
 
+class RMSNorm(nn.Module):
+    """RMS normalization with one learned scale vector and no bias."""
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -53,10 +67,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.attn_dropout = config.attn_dropout
         inner = config.n_head * config.head_dim
-        self.wq = nn.Linear(config.n_embd, inner, bias=True)
-        self.wk = nn.Linear(config.n_embd, inner, bias=True)
-        self.wv = nn.Linear(config.n_embd, inner, bias=True)
-        self.wo = nn.Linear(inner, config.n_embd, bias=True)
+        self.wq = nn.Linear(config.n_embd, inner, bias=config.linear_bias)
+        self.wk = nn.Linear(config.n_embd, inner, bias=config.linear_bias)
+        self.wv = nn.Linear(config.n_embd, inner, bias=config.linear_bias)
+        self.wo = nn.Linear(inner, config.n_embd, bias=config.linear_bias)
 
     def forward(self, x):
         bsz, seqlen, _ = x.shape
@@ -74,9 +88,9 @@ class FFN(nn.Module):
     """Vanilla Linear-ReLU-Linear FFN."""
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, config.n_ffn, bias=True)
+        self.c_fc = nn.Linear(config.n_embd, config.n_ffn, bias=config.linear_bias)
         self.relu = nn.ReLU()
-        self.c_proj = nn.Linear(config.n_ffn, config.n_embd, bias=True)
+        self.c_proj = nn.Linear(config.n_ffn, config.n_embd, bias=config.linear_bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -84,17 +98,17 @@ class FFN(nn.Module):
 
 
 class Block(nn.Module):
-    """Post-LayerNorm block: x = LN(x + sublayer(x))."""
+    """Pre-RMSNorm block with no normalization bias."""
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
         self.mlp = FFN(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
 
     def forward(self, x):
-        x = self.ln_1(x + self.attn(x))
-        x = self.ln_2(x + self.mlp(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -105,7 +119,9 @@ class ToyVanilla(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=True)  # untied
+        self.lm_head = nn.Linear(
+            config.n_embd, config.vocab_size, bias=config.linear_bias
+        )  # untied
 
         pe = sinusoidal_encoding(config.block_size, config.n_embd,
                                  torch.device(config.device))

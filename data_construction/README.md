@@ -447,12 +447,12 @@ $H_{VV} = I \otimes (W D_{\pi_x} W^\top)$ 与目标分布无关；条件分布 $
 | 参数 | 默认 | 作用 |
 |------|------|------|
 | `vocab_size` | 1024 | 词表大小 V |
-| `n_train_tokens` | 100_000 | train 样本对数（默认按 full-batch 实验规模设置） |
-| `n_val_tokens` | 10_000 | val 样本对数 |
+| `n_train_tokens` | 131_072 ($2^{17}$) | train 样本对数（必须为正整数 2 的幂） |
+| `n_val_tokens` | 16_384 ($2^{14}$) | val 样本对数（必须为正整数 2 的幂） |
 | `alpha_x` | 1.0 | 输入边际 zipf 指数（0 = uniform） |
 | `alpha_y` | 0.0 | 输出边际 zipf 指数（0 = uniform） |
 | `seed` | 1337 | 随机种子 |
-| `out_dir` | `data/synth_shuffled_x1_y0_100k_V1024` | 输出目录 |
+| `out_dir` | `data/synth_shuffled_x1_y0_2p17train_2p14val_V1024` | 输出目录 |
 
 ### train/val 语义与 full-batch 用法
 
@@ -460,7 +460,7 @@ $H_{VV} = I \otimes (W D_{\pi_x} W^\top)$ 与目标分布无关；条件分布 $
 是训练侧的决定，不影响数据格式。
 
 - **minibatch 实验**：从 train 采 minibatch，在 val 上评估（常规用法）。
-- **full-batch 实验**：生成一个 train 恰为目标规模（默认 100k）的数据集，把
+- **full-batch 实验**：生成一个 train 恰为目标规模（默认 $2^{17}$）的数据集，把
   **整个 train 分片作为一个 batch** 训练；评估与 Hessian 分析也在 train 上——
   full-batch 下 $L_{\text{train}}$ 就是优化器下降的精确目标函数，它的梯度/Hessian
   才是训练动态本身。val 不参与训练，留作可选的泛化对照。
@@ -468,11 +468,11 @@ $H_{VV} = I \otimes (W D_{\pi_x} W^\top)$ 与目标分布无关；条件分布 $
 ```bash
 cd data_construction
 
-# full-batch 数据集（默认即 100k train + 10k val）
+# full-batch 数据集（默认即 2^17 train + 2^14 val）
 python build_shuffled_dataset.py
 
 # minibatch 规模
-python build_shuffled_dataset.py n_train_tokens=1000000 n_val_tokens=50000 out_dir=data/synth_shuffled_1M
+python build_shuffled_dataset.py n_train_tokens=1048576 n_val_tokens=65536 out_dir=data/synth_shuffled_2p20
 
 # 其它旋钮
 python build_shuffled_dataset.py vocab_size=2048 alpha_x=1.0 alpha_y=0.5

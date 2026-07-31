@@ -19,11 +19,12 @@ imbalance / fineweb) × 模型深度** 对训练动态和 Hessian 谱的影响
 toy_models/
 ├── config/                      # 配置体系（所有入口脚本共用）
 │   ├── schema.py                #   dataclass 定义：Model/Data/Optim/LR/Train/AnalyzeConfig
-│   ├── presets.py               #   EXPERIMENTS dict：preset 名 -> 完整 ExperimentConfig
+│   ├── presets.py               #   当前 full-batch GD/Adam 两个 preset
+│   ├── legacy_presets.py        #   历史 preset 归档，不自动注册
 │   ├── build.py                 #   build_optimizer / make_lr_fn（config -> torch 对象）
 │   └── __init__.py              #   load(preset) + apply_overrides(--group.key=value)
 │
-├── vanilla_model.py             # ToyVanilla：Post-LN + sinusoidal PE + ReLU FFN（方案 C）
+├── vanilla_model.py             # ToyVanilla：Pre-RMSNorm + sinusoidal PE + ReLU FFN
 │                                #   支持 block_type="mlp"（attention 槽换成第二个 FFN）
 │                                #   与 loss_type="ce"/"mse"
 ├── simpliest_model.py           # ToyVanilla 变体：forward 不加位置编码；n_layer=0
@@ -108,21 +109,22 @@ SLQ 以 `ritz_v<k>.npz` 为标志——重跑同一命令会自动跳过已完�
 | FFN size `d_ff`             | 1024                  |
 | Context length              | 128（fineweb: 1024）  |
 | Position encoding           | Fixed sinusoidal      |
-| Normalization               | Post-LayerNorm        |
+| Normalization               | Pre-RMSNorm（所有 block 类型）+ final RMSNorm |
 | FFN activation              | ReLU                  |
 | Weight tying                | False（untied）       |
-| Linear bias                 | True                  |
+| Linear bias                 | False                 |
 | Dropout                     | 0                     |
 
 深度是 preset 的自由维度：`n_layer ∈ {0 (simpliest/mse0), 1 (vanilla), 5 (layer5,
 mlp10), 20 (layer20)}`。单层参数量分解（`python3 vanilla_transformer.py` 可打印）：
 
 ```
-N_embed+head  = 2·V·d + V                  = 394,240   (V=1024)
-N_block       = 4d² + 2·d·d_ff + 9d + d_ff = 543,424   (每层)
+N_embed+head  = 2·V·d                      = 393,216   (V=1024)
+N_block       = 4d² + 2·d·d_ff + 2d        = 541,056   (每层)
+N_final_norm  = d                           = 192       (n_layer > 0)
 ```
 
-如 layer5（V=1024）总参数 3,111,360 ≈ 3.11M。
+如 layer5（V=1024）总参数 3,098,688 ≈ 3.10M。
 
 变体（都由 preset 的 model 字段控制，无需改代码）：
 

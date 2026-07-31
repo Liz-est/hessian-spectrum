@@ -39,6 +39,10 @@ class ModelConfig:
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
+    # Apply one bias policy to every matrix-valued nn.Linear module (Q/K/V/O,
+    # FFN projections, and the untied LM head). Embeddings never have a bias.
+    linear_bias: bool = False
+    norm_eps: float = 1e-6
     # training objective:
     #   "ce"  -> softmax cross-entropy on integer targets (the default)
     #   "mse" -> mean-squared error between logits and the one-hot target
@@ -48,6 +52,13 @@ class ModelConfig:
     # adding pos_enc, making the 0-layer model position-independent like
     # simpliest_model while keeping the vanilla_model class / ckpt loading path.
     use_pos_enc: bool = True
+    # Independent Normal initialization controls for the token embedding and
+    # untied LM head. std=0 gives a constant matrix equal to its mean.
+    # New models use zero-mean initialization; presets can override each matrix.
+    tok_emb_init_mean: float = 0.0
+    tok_emb_init_std: float = 0.02
+    lm_head_init_mean: float = 0.0
+    lm_head_init_std: float = 0.02
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +206,12 @@ class ExperimentConfig:
             vocab_size=m.vocab_size, n_embd=m.n_embd, n_head=m.n_head,
             head_dim=m.head_dim, n_ffn=m.n_ffn, n_layer=m.n_layer,
             block_type=m.block_type, block_size=m.block_size, dropout=m.dropout,
-            attn_dropout=m.attn_dropout, loss_type=m.loss_type,
+            attn_dropout=m.attn_dropout, linear_bias=m.linear_bias,
+            norm_eps=m.norm_eps,
+            loss_type=m.loss_type,
             use_pos_enc=m.use_pos_enc,
+            tok_emb_init_mean=m.tok_emb_init_mean,
+            tok_emb_init_std=m.tok_emb_init_std,
+            lm_head_init_mean=m.lm_head_init_mean,
+            lm_head_init_std=m.lm_head_init_std,
         )

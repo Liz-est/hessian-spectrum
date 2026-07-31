@@ -17,14 +17,17 @@ same logs -- with these deliberate differences:
   * single-process only (no DDP): the full batch fits one device, and DDP
     averaging would just re-implement the accumulation loop.
 
-Intended presets (config/presets.py): fullbatch-mse0-shuffled-{gd,adam} --
+Intended presets (config/presets.py): fullbatch-mse0-shuffled-2p17-{gd,adam} --
 the 0-layer embed+lm_head MSE model without pos_enc (_MODEL_EMBED_HEAD_MSE_POS0)
-on the shuffled-marginals data from build_shuffled_dataset.py, whose 100k-pair
-train split is sized to BE the full batch.
+on the shuffled-marginals data from build_shuffled_dataset.py, whose 2^17-pair
+train split is sized to BE the full batch. The 2^14-pair validation split and
+the train split are both exact multiples of block_size=128.
 
-    python3 train_fullbatch.py fullbatch-mse0-shuffled-gd
-    python3 train_fullbatch.py fullbatch-mse0-shuffled-adam
-    python3 train_fullbatch.py fullbatch-mse0-shuffled-gd --train.max_iters=40  # smoke test
+    python3 train_fullbatch.py fullbatch-mse0-shuffled-2p17-gd
+    python3 train_fullbatch.py fullbatch-mse0-shuffled-2p17-adam
+    python3 train_fullbatch.py fullbatch-mse0-shuffled-2p17-gd --train.max_iters=40
+    python3 train_fullbatch.py fullbatch-mse0-shuffled-2p17-adam \
+        --model.tok_emb_init_std=0.05 --model.lm_head_init_std=0
 """
 
 import os
@@ -78,14 +81,24 @@ def resolve_data_dir(name):
 
 
 def load_split(data_dir, prefix, device):
-    """Load <prefix>_x.bin / <prefix>_y.bin and reshape into (n_seq, block_size)
-    rows (remainder tokens dropped). The whole split is tiny, so it lives on
-    the device as one fixed tensor -- this IS the full batch."""
+    """Load <prefix>_x.bin / <prefix>_y.bin as the exact full split.
+
+    Require complete block_size rows instead of silently dropping a tail: the
+    dataset generator uses power-of-two split sizes, so the default block size
+    divides both splits exactly.
+    """
     x = np.fromfile(os.path.join(data_dir, f"{prefix}_x.bin"), dtype=np.uint16)
     y = np.fromfile(os.path.join(data_dir, f"{prefix}_y.bin"), dtype=np.uint16)
+    if len(x) != len(y):
+        raise ValueError(f"{prefix}: x/y length mismatch ({len(x)} != {len(y)})")
+    if len(x) % block_size:
+        raise ValueError(
+            f"{prefix}: {len(x)} pairs is not divisible by block_size={block_size}; "
+            "regenerate the split or choose a compatible block size"
+        )
     n_seq = len(x) // block_size
-    X = torch.from_numpy(x[:n_seq * block_size].astype(np.int64)).view(n_seq, block_size)
-    Y = torch.from_numpy(y[:n_seq * block_size].astype(np.int64)).view(n_seq, block_size)
+    X = torch.from_numpy(x.astype(np.int64)).view(n_seq, block_size)
+    Y = torch.from_numpy(y.astype(np.int64)).view(n_seq, block_size)
     return X.to(device), Y.to(device)
 
 

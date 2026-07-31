@@ -13,111 +13,66 @@ checkpoint 计划、模型结构不会漂移。
   `to_model_config()` 把 `ModelConfig` 转成模型类要的 `ToyVanillaConfig`。
 * `config/build.py` — `build_optimizer()`(按 `optim.name` 分发 sgd/adamw/adam)和
   `make_lr_fn()`(warmup + cosine/constant)。
-* `config/presets.py` — 命名预设字典 `EXPERIMENTS`,和默认名 `DEFAULT`。
+* `config/presets.py` — 当前实验的命名预设字典 `EXPERIMENTS`。
+* `config/legacy_presets.py` — 历史实验归档，不会被 `config.load()` 自动注册。
 * `config/__init__.py` — `load(name)` 返回预设的深拷贝;`apply_overrides(cfg, argv)`
   应用 CLI 覆盖。
 
-## 现有预设(`config/presets.py`)
+## 当前预设（`config/presets.py`）
 
 | 预设名 | 模型 | 优化器 | run_name / files_name |
 |---|---|---|---|
-| `imbalance_s1_sgd`(默认) | 单层 vanilla,n_layer=1 | SGD | `vanilla_imbalance_s1-sgd` |
-| `imbalance_s1_adamw` | 单层 vanilla,n_layer=1 | AdamW | `vanilla_imbalance_s1-adamw` |
-| `simpliest_sgd-{imbalance,balance}` | 仅 embed+lm_head,n_layer=0 | SGD | `simpliest_*-sgd` |
-| `simpliest_adamw-{imbalance,balance}` | 仅 embed+lm_head,n_layer=0 | AdamW | `simpliest_*-adamw` |
-| `simpliest_{imbalance,balance}_1B_sgd` | 仅 embed+lm_head,1B 数据 | SGD | `simpliest_*_1B-sgd` |
-| `layer5-{imbalance-s1,balance}-{sgd,adamw}` | 5 层 vanilla,n_layer=5 | SGD/AdamW | `layer5-*` |
-| `layer5-{imbalance-s1,balance}-1B-adamw` | 5 层 vanilla,1B 数据 | AdamW | `layer5-*-1B-adamw` |
-| `mlp10_{sgd,adamw}-{imbalance,balance}` | 10 FFN(无 attention），n_layer=5+block_type=mlp | SGD/AdamW | `mlp10_*` |
-| `fineweb10B-adamw` | 5 层 vanilla，真实语料 FineWeb-10B（GPT-2 BPE，vocab 50304，block_size 1024） | AdamW | `fineweb10B-adamw` |
+| `fullbatch-mse0-shuffled-2p17-gd` | 无位置编码的 embed→lm_head，MSE，n_layer=0 | full-batch GD | 同 preset 名 |
+| `fullbatch-mse0-shuffled-2p17-adam` | 无位置编码的 embed→lm_head，MSE，n_layer=0 | full-batch Adam | 同 preset 名 |
 
-`mlp10_*` 是把 5 层 vanilla 里每个 block 的 attention 子层换成 FFN（`block_type="mlp"`）
-得到的纯 MLP 模型：10 个 FFN 子层 + embed + lm_head，没有 attention。走 vanilla 那条
-train/analyze 链，Hessian 里 attn 槽按逐神经元（neuron）分块。
+两项只改变优化器及其学习率。共同设置包括：`2^17` 个训练样本、`2^14`
+个验证样本、embedding `Normal(0, 0.02)`、lm_head 全零初始化、无 bias、
+constant LR、无 warmup/weight decay/gradient clipping，以及训练 200 iter。
 
-`fineweb10B-adamw` 是唯一的**真实数据**预设：数据在 `<repo-root>/data/fineweb10B/`，是
-modded-nanoGPT 的单流 shard 格式（每个 `fineweb_*.bin` 有 1024 字节 header + uint16 token
-流，target = 输入右移一位），因此 `DataConfig.format="nanogpt_shards"`；synth 双流数据
-（`train_x.bin`/`train_y.bin`）用默认的 `format="dual_stream"`。train/analyze 脚本按此字段
-选数据加载器，模型、优化器、Hessian 机器完全复用。训练预算：20k iters，bs=32，
-warmup=400，lr 6e-4→6e-5。
-
-`vanilla` 脚本默认 `imbalance_s1_sgd`,`simpliest` 脚本默认 `simpliest_sgd-imbalance`
-(见 `train_simpliest_model.py` / `analyze_simpliest.py` 顶部的 `load(...)`,改预设 key
-时记得同步这两处硬编码名)。
+历史 Transformer、FineWeb、freeze 和超参数 sweep 配置保存在
+`legacy_presets.py` 的 `LEGACY_EXPERIMENTS` 中。它们只用于查阅和恢复；
+若要重新运行，应先选择性移回 `presets.py`，而不是由当前入口隐式加载。
 
 ## 本地运行
 
-train / analyze 脚本接受两类 CLI:一个 **bare token = 预设名**(整体替换默认预设),
-以及任意个 `--group.key=value` 覆盖单个字段。
+当前 full-batch 训练入口接受一个 **bare token = 预设名**，以及任意个
+`--group.key=value` 临时覆盖单个字段：
 
 ```bash
 cd toy_models
-python train_vanilla_transformer.py                          # 默认预设 imbalance_s1_sgd
-python train_vanilla_transformer.py imbalance_s1_adamw       # 换成另一个预设
-python train_vanilla_transformer.py --optim.name=adamw --lr.learning_rate=3e-4
-python train_simpliest_model.py                              # 默认预设 simpliest_sgd-imbalance
-python analyze_simpliest.py --analyze.max_classes=1024       # 全词表 lm_head/embedding
-torchrun --standalone --nproc_per_node=8 train_vanilla_transformer.py   # 8 卡 DDP
+python train_fullbatch.py fullbatch-mse0-shuffled-2p17-gd
+python train_fullbatch.py fullbatch-mse0-shuffled-2p17-adam
+python train_fullbatch.py fullbatch-mse0-shuffled-2p17-gd \
+  --lr.learning_rate=3e-4 \
+  --train.run_name=fullbatch-mse0-shuffled-2p17-gd-lr3e-4
 ```
 
 ## SCO 提交实验
 
-两个提交脚本各自绑定一套模型和它的 train/analyze 脚本:
-
-* `submit_sco_vanilla.py`   → `train_vanilla_transformer.py` + `analyze_vanilla.py`(默认 `imbalance_s1_sgd`)
-* `submit_sco_simpliest.py` → `train_simpliest_model.py` + `analyze_simpliest.py`(默认 `simpliest_sgd-imbalance`)
+当前入口是 `submit_sco_fullbatch.py`。它在单个 H100 节点上为 GD 和 Adam
+各分配一张 GPU，并分别调用 `train_fullbatch.py`。
 
 ```bash
-cd /data/250010020/hessian-spectrum
-python3 toy_models/submit_sco_simpliest.py          # 问 y/n 再提交
-python3 toy_models/submit_sco_simpliest.py --yes    # 直接提交
+python3 toy_models/submit_sco_fullbatch.py
+python3 toy_models/submit_sco_fullbatch.py --yes
 ```
-
-提交前记得把脚本里的 `JOB_NAME` 改成唯一名字。
-
-### 提交时换/覆盖预设
-
-改提交脚本里的 `EXP_ARGS`(train 和 analyze 两阶段共用同一份,保证 `run_name` /
-checkpoint 计划一致):
-
-```python
-EXP_ARGS = ""                        # 留空 = 用脚本各自的默认预设
-EXP_ARGS = "simpliest_sgd"           # 用某个命名预设(bare token)
-EXP_ARGS = "--optim.name=adamw"      # 临时覆盖单个字段
-EXP_ARGS = "imbalance_s1_adamw --lr.learning_rate=3e-4"   # 两者叠加
-```
-
-注意:bare token 会**整体替换**默认预设。在 `submit_sco_simpliest.py` 里若写成
-一个 n_layer=1 的预设名(如 `imbalance_s1_sgd`),simpliest 脚本就会去建带
-transformer block 的模型——别写错名字。
 
 ## 新增 / 修改预设
 
-改 `config/presets.py` 的 `EXPERIMENTS` 字典:复制一个已有 block,起唯一 key,只改要变
-的字段,并让 `run_name` / `files_name` 和 key 对应(避免和别的实验撞输出目录)。例如加个
-AdamW 版的 simpliest:
-
-```python
-"simpliest_adamw": ExperimentConfig(
-    name="simpliest_adamw",
-    model=copy.deepcopy(_MODEL_EMBED_HEAD),      # n_layer=0
-    data=DataConfig(dataset="synth_zipf_imbalanced_s1_V1024", batch_size=64),
-    optim=OptimConfig(name="adamw", betas=(0.9, 0.95), weight_decay=0.1, grad_clip=1.0),
-    lr=LRConfig(scheduler="cosine", learning_rate=6e-4, min_lr=3e-5, warmup_iters=200),
-    train=TrainConfig(max_iters=8000, run_name="simpliest_imbalance_s1-adamw",
-                      ckpt_fracs=dict(_CKPT_9)),
-    analyze=AnalyzeConfig(files_name="simpliest_imbalance_s1-adamw"),
-),
-```
-
-然后本地 `python train_simpliest_model.py simpliest_adamw`,或提交时 `EXP_ARGS = "simpliest_adamw"`。
+在 `config/presets.py` 的 `EXPERIMENTS` 中复制当前最接近的配置，并确保
+字典 key、`name`、`train.run_name` 与 `analyze.files_name` 相互对应。历史配置
+若重新启用，也应选择性复制回来，不要整体重新注册。
 
 ## 各字段含义(改哪调哪,见 `config/schema.py`)
 
 * **模型结构** `ModelConfig`:`n_layer`(0=仅 embed+head,1=单层,5=五层)、
   `block_type`(`transformer`=attn+FFN,`mlp`=FFN+FFN 无 attention)、`n_embd`、`n_head`、
-  `head_dim`、`n_ffn`、`vocab_size`、`block_size`
+  `head_dim`、`n_ffn`、`vocab_size`、`block_size`、`linear_bias`（统一控制所有
+  attention / FFN / lm_head 的 `nn.Linear` 是否带 bias，默认 false；embedding
+  本身无 bias）、`norm_eps`（所有 block 中 RMSNorm 的数值稳定项）
+* **独立初始化** `ModelConfig`：`tok_emb_init_mean` / `tok_emb_init_std` 与
+  `lm_head_init_mean` / `lm_head_init_std` 分别控制 embedding 和 lm_head 的
+  Normal 初始化；`std=0` 时对应矩阵恒等于所设 mean。
 * **数据/batch** `DataConfig`：`dataset`、`batch_size`（每卡；有效 batch = ×world_size）、
   `format`（`dual_stream` = synth 双流 `train_x.bin`/`train_y.bin`，默认；`nanogpt_shards` =
   FineWeb 单流 shard，header 后连续 token，target 右移一位）
@@ -138,4 +93,3 @@ AdamW 版的 simpliest:
 * 覆盖时用**点号全路径**:`--optim.name=adamw`、`--lr.learning_rate=3e-4`、
   `--train.max_iters=8000`、`--analyze.max_classes=1024`,不能只写 `--max_iters=...`。
 * `betas` 这类 tuple 字段用逗号写:`--optim.betas=0.9,0.999`。
-

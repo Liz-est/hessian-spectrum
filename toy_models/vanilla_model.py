@@ -2,17 +2,19 @@
 Minimal single-layer vanilla decoder-only Transformer for toy experiments.
 
 Design choices (match the param-counting formulas in the README):
-  - Post-LayerNorm (weight + bias)          -> 2 LN/block, each 2d = 4d params
+  - Every block uses pre-RMSNorm             -> scale only, no affine bias
+  - Final RMSNorm after the block stack       -> only when n_layer > 0
   - Fixed sinusoidal position encoding       -> no trainable position params
-  - Multi-head causal self-attention (bias)  -> 4 d^2 + 4d
-  - FFN: Linear-ReLU-Linear (bias)           -> 2 d*d_ff + d_ff + d
-  - LM Head with bias, NOT tied to embedding -> V*d + V
+  - Multi-head causal self-attention          -> configurable Linear bias
+  - FFN: Linear-ReLU-Linear                   -> configurable Linear bias
+  - LM Head, NOT tied to embedding            -> configurable Linear bias
   - Token embedding                          -> V*d
 
-Parameter counts (single layer, bias on):
-  N_embed+head  = 2*V*d + V
-  N_transformer = 4*d^2 + 2*d*d_ff + 9*d + d_ff
-      where 9d = 4d (attn qkvo bias) + d (ffn out bias) + 4d (2 post-LN)
+Default parameter counts for a Transformer block:
+  N_embed+head  = 2*V*d
+  N_transformer = 4*d^2 + 2*d*d_ff + 2d
+      where 2d is the pair of RMSNorm scale vectors.
+  N_final_norm  = d when n_layer > 0
 """
 
 import math
@@ -35,8 +37,14 @@ class ToyVanillaConfig:
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
+    linear_bias: bool = False  # one policy for attention/FFN/lm_head Linear modules
+    norm_eps: float = 1e-6
     loss_type: str = "ce"      # "ce" (softmax cross-entropy) | "mse" (vs one-hot)
     use_pos_enc: bool = True   # False -> skip adding the sinusoidal pos_enc in forward
+    tok_emb_init_mean: float = 0.0
+    tok_emb_init_std: float = 0.02
+    lm_head_init_mean: float = 0.0
+    lm_head_init_std: float = 0.02
     device: str = "cpu"
 
 
@@ -51,6 +59,18 @@ def sinusoidal_encoding(seqlen, dim, device):
     return pe
 
 
+class RMSNorm(nn.Module):
+    """RMS normalization with one learned scale vector and no bias."""
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -58,10 +78,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         self.attn_dropout = config.attn_dropout
         inner = config.n_head * config.head_dim
-        self.wq = nn.Linear(config.n_embd, inner, bias=True)
-        self.wk = nn.Linear(config.n_embd, inner, bias=True)
-        self.wv = nn.Linear(config.n_embd, inner, bias=True)
-        self.wo = nn.Linear(inner, config.n_embd, bias=True)
+        self.wq = nn.Linear(config.n_embd, inner, bias=config.linear_bias)
+        self.wk = nn.Linear(config.n_embd, inner, bias=config.linear_bias)
+        self.wv = nn.Linear(config.n_embd, inner, bias=config.linear_bias)
+        self.wo = nn.Linear(inner, config.n_embd, bias=config.linear_bias)
 
     def forward(self, x):
         bsz, seqlen, _ = x.shape
@@ -79,9 +99,9 @@ class FFN(nn.Module):
     """Vanilla Linear-ReLU-Linear FFN."""
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, config.n_ffn, bias=True)
+        self.c_fc = nn.Linear(config.n_embd, config.n_ffn, bias=config.linear_bias)
         self.relu = nn.ReLU()
-        self.c_proj = nn.Linear(config.n_ffn, config.n_embd, bias=True)
+        self.c_proj = nn.Linear(config.n_ffn, config.n_embd, bias=config.linear_bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -89,25 +109,26 @@ class FFN(nn.Module):
 
 
 class Block(nn.Module):
-    """Post-LayerNorm block: x = LN(x + sublayer(x)).
+    """Pre-normalized block with no normalization bias.
 
     The first sub-layer is attention for a "transformer" block, or a second FFN
     for an "mlp" block (an MLP-only model). Both have the same n_embd->n_embd
     shape, so it is a drop-in swap and forward() is identical either way. The
     attribute stays `self.attn` so checkpoints and the analyzer's blocks.<i>.attn
-    path prefix are unchanged regardless of block_type.
+    path prefix are unchanged regardless of block_type. Both variants use
+    RMSNorm, with no LayerNorm or normalization bias anywhere.
     """
     def __init__(self, config):
         super().__init__()
         self.attn = FFN(config) if config.block_type == "mlp" \
             else CausalSelfAttention(config)
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
         self.mlp = FFN(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
 
     def forward(self, x):
-        x = self.ln_1(x + self.attn(x))
-        x = self.ln_2(x + self.mlp(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -118,19 +139,50 @@ class ToyVanilla(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=True)  # untied
+        # A final norm is standard in pre-norm Transformers. Keep n_layer=0 as
+        # the exact embed->lm_head model used by the full-batch experiment.
+        self.final_norm = (
+            RMSNorm(config.n_embd, config.norm_eps)
+            if config.n_layer > 0
+            else nn.Identity()
+        )
+        self.lm_head = nn.Linear(
+            config.n_embd, config.vocab_size, bias=config.linear_bias
+        )  # untied
 
         pe = sinusoidal_encoding(config.block_size, config.n_embd,
                                  torch.device(config.device))
         self.register_buffer("pos_enc", pe, persistent=False)  # fixed, non-trainable
 
+        if config.tok_emb_init_std < 0 or config.lm_head_init_std < 0:
+            raise ValueError("initialization std must be non-negative")
         self.apply(self._init_weights)
+        print(
+            "initialization: "
+            f"tok_emb=Normal({config.tok_emb_init_mean}, {config.tok_emb_init_std}), "
+            f"lm_head=Normal({config.lm_head_init_mean}, {config.lm_head_init_std})"
+        )
         print(f"number of parameters: {self.num_params()/1e6:.3f}M")
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=1.0, std=0.02)
-            #torch.nn.init.ones_(module.weight)
+        if module is self.tok_emb:
+            torch.nn.init.normal_(
+                module.weight,
+                mean=self.config.tok_emb_init_mean,
+                std=self.config.tok_emb_init_std,
+            )
+        elif module is self.lm_head:
+            torch.nn.init.normal_(
+                module.weight,
+                mean=self.config.lm_head_init_mean,
+                std=self.config.lm_head_init_std,
+            )
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, (nn.Linear, nn.Embedding)):
+            # Transformer-block matrices use the standard zero-mean Normal.
+            # The full-batch n_layer=0 model has no such modules.
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
@@ -146,6 +198,7 @@ class ToyVanilla(nn.Module):
             ffn += sum(p.numel() for p in blk.mlp.parameters())
             ln += sum(p.numel() for p in blk.ln_1.parameters())
             ln += sum(p.numel() for p in blk.ln_2.parameters())
+        ln += sum(p.numel() for p in self.final_norm.parameters())
         total = self.num_params()
         return {
             "token_embedding": tok,
@@ -167,6 +220,7 @@ class ToyVanilla(nn.Module):
         x = self.drop(x)
         for block in self.blocks:
             x = block(x)
+        x = self.final_norm(x)
         if targets is not None:
             logits = self.lm_head(x)
             if self.config.loss_type == "mse":

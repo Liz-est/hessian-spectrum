@@ -35,7 +35,7 @@ Both splits are always written; how they are used is the trainer's decision:
 
 * minibatch experiments: sample minibatches from train, evaluate on val.
 * full-batch experiments: generate a dataset whose train split IS the full
-  batch (the default n_train_tokens=100_000 is sized for this), load the
+  batch (the default n_train_tokens=2**17 is sized for this), load the
   whole train split as one batch, and run eval / Hessian analysis on train
   as well -- L_train is the exact objective the optimizer descends, so its
   gradient/Hessian are the training dynamics.  val is an optional
@@ -43,7 +43,7 @@ Both splits are always written; how they are used is the trainer's decision:
 
 Usage
 -----
-    # full-batch dataset (defaults: 100k train pairs + 10k val pairs)
+    # full-batch dataset (defaults: 2^17 train pairs + 2^14 val pairs)
     python build_shuffled_dataset.py
 
     # minibatch-scale dataset
@@ -69,10 +69,10 @@ import transition as T
 CONFIG = dict(
     # --- vocabulary & size ---------------------------------------------------
     vocab_size=1024,
-    n_train_tokens=100_000,        # total pairs in the training stream;
+    n_train_tokens=2**17,          # 131,072 pairs in the training stream;
                                    # default sized so the whole train split can
                                    # serve as ONE full batch
-    n_val_tokens=10_000,           # total pairs in the validation stream
+    n_val_tokens=2**14,            # 16,384 pairs in the validation stream
                                    # (optional generalization check)
 
     # --- marginals: the ONLY thing this construction controls ----------------
@@ -82,7 +82,7 @@ CONFIG = dict(
 
     # --- misc ----------------------------------------------------------------
     seed=1337,
-    out_dir="data/synth_shuffled_x1_y0_100k_V1024",
+    out_dir="data/synth_shuffled_x1_y0_2p17train_2p14val_V1024",
 )
 
 
@@ -167,6 +167,11 @@ def write_stream(prefix, n_tokens, pi_x, pi_y, rng, out_dir):
 def build(cfg):
     rng = np.random.default_rng(cfg["seed"])
     V = cfg["vocab_size"]
+
+    for key in ("n_train_tokens", "n_val_tokens"):
+        n = cfg[key]
+        if not isinstance(n, int) or isinstance(n, bool) or n <= 0 or n & (n - 1):
+            raise ValueError(f"{key} must be a positive power of two, got {n!r}")
 
     pi_x = T.make_pi(V, kind="zipf", zipf_s=cfg["alpha_x"])
     pi_y = T.make_pi(V, kind="zipf", zipf_s=cfg["alpha_y"])
