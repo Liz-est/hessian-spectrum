@@ -182,7 +182,8 @@ def build_optimizer(params, cfg):
             if not p.requires_grad:
                 continue
             # hidden matrices -> Muon; embeddings / lm_head / 1D -> aux AdamW
-            if p.ndim >= 2 and "tok_emb" not in n and "lm_head" not in n:
+            #if p.ndim >= 2 and "tok_emb" not in n and "lm_head" not in n:
+            if p.ndim >= 2:
                 muon_params.append(p)
             else:
                 aux_params.append(p)

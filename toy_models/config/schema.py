@@ -43,6 +43,9 @@ class ModelConfig:
     #   "ce"  -> softmax cross-entropy on integer targets (the default)
     #   "mse" -> mean-squared error between logits and the one-hot target
     #            vector (ignore_index=-1 positions are still dropped)
+    #   "mse_rep" -> replication convention: 0.5 * per-position SUM over
+    #            classes of the squared error vs one-hot, averaged over
+    #            positions (== (V/2) * "mse"; matches RotatedMatrixBigram)
     loss_type: str = "ce"
     # sinusoidal position encoding (vanilla_model only): False -> forward skips
     # adding pos_enc, making the 0-layer model position-independent like
