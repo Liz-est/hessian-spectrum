@@ -166,3 +166,10 @@ sco-backup/
 
 # try
 /toy_models/new_metric/
+
+# replication
+/replication
+
+#reduce the load of vscode
+pyrightconfig.json
+kill-stuck-claude.sh
