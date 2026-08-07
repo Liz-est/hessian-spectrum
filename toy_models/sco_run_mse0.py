@@ -55,10 +55,25 @@ NPROC_PER_NODE = 8
 # preset keys only; the job name is derived from the key. Batches of at most
 # two, sequential.
 BATCHES = [
-    ["mse0-pos0-frozen_lmhead-adamw-lr9e-3-imb-init1G-iter1500",
-     "mse0-pos0-frozen_embd-adamw-lr9e-3-imb-init1G-iter1500"],
-    # ["mse0-pos0-frozen_lmhead-sgd-lr0p05-imb-init1G-iter1500",
-    #   "mse0-pos0-frozen_lmhead-adamw-lr1p5e-3-imb-init1G-iter1500"],
+    # # ---- SGD fine-tune (3 pts): 0.007, 0.013, 0.017 ----
+    # ["REP1-frz_lmhead-sgd-lr0p007-G02",
+    #  "REP1-frz_lmhead-sgd-lr0p013-G02"],
+    # ["REP1-frz_lmhead-sgd-lr0p017-G02",
+    #  "REP1-frz_lmhead-adam-lr1e-6-G02"],
+    # # ---- Adam geometric sweep (6 pts): 1e-6..5e-5 ----
+    # ["REP1-frz_lmhead-adam-lr2e-6-G02",
+    #  "REP1-frz_lmhead-adam-lr5e-6-G02"],
+    # ["REP1-frz_lmhead-adam-lr1e-5-G02",
+    #  "REP1-frz_lmhead-adam-lr2e-5-G02"],
+    ["REP-mserep-pos0-frz_embd-fullbs-sgd-lr0p05-imb-initG02-nobias",
+     "REP-mserep-pos0-frz_embd-fullbs-sgd-lr0p07-imb-initG02-nobias"],
+    # ---- Muon geometric sweep (5 pts): 2e-5..4e-4 ----
+    ["REP-mserep-pos0-frz_embd-fullbs-sgd-lr0p09-imb-initG02-nobias",
+     "REP-mserep-pos0-frz_embd-fullbs-adam-lr6e-6-imb-initG02-nobias"],
+    ["REP-mserep-pos0-frz_embd-fullbs-adam-lr9e-6-imb-initG02-nobias",
+      "REP-mserep-pos0-frz_embd-fullbs-adam-lr2e-6-imb-initG02-nobias"],
+
+    
 ]
 
 POLL_SECONDS = 300
@@ -96,7 +111,8 @@ def purge_all_outputs(preset):
         log(f"removed files/{files_name}/ entirely")
     run_dir = os.path.join(WORK_DIR, "runs", run_name)
     for stale in ("val_from_ckpts.csv", "loss_curve_with_val.png",
-                  "val_by_freq.csv", "val_by_freq.png"):
+                  "val_by_freq.csv", "val_by_freq.png",
+                  "rep_groups.csv", "rep_groups.png"):
         p = os.path.join(run_dir, stale)
         if os.path.exists(p):
             os.remove(p)
@@ -104,18 +120,13 @@ def purge_all_outputs(preset):
 
 
 def command_for(preset):
-    _files_name, run_name = resolve_dirs(preset)
     analyze = (f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
                f"--nproc_per_node={NPROC_PER_NODE} analyze_vanilla.py {preset}")
     train = (f"{ENV_PYTHON} -u -m torch.distributed.run --standalone "
              f"--nproc_per_node={NPROC_PER_NODE} train_vanilla_transformer.py {preset}")
-    # per-frequency-group class-loss curves right after training (single
-    # process, seconds on GPU) so the figure exists even if analyze dies.
-    by_freq = (f"{ENV_PYTHON} -u eval_ckpts_val_by_freq.py "
-               f"{run_name} --batch_size=64")
     return (f"cd {WORK_DIR} && "
             f"export PATH={CONDA_ENV_PATH}/bin:$PATH && "
-            f"{train} && {by_freq} && {analyze}")
+            f"{train} && {analyze}")
 
 
 def list_jobs():

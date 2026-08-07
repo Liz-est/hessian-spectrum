@@ -35,8 +35,12 @@ class ToyVanillaConfig:
     block_size: int = 128      # context length
     dropout: float = 0.0
     attn_dropout: float = 0.0
-    loss_type: str = "ce"      # "ce" (softmax cross-entropy) | "mse" (vs one-hot)
+    loss_type: str = "ce"      # "ce" (softmax cross-entropy) | "mse" (vs one-hot,
+                               # mean over classes) | "mse_rep" (0.5 * SUM over
+                               # classes per position -- the replication
+                               # convention; == (C/2) * mse)
     use_pos_enc: bool = True   # False -> skip adding the sinusoidal pos_enc in forward
+
     device: str = "cpu"
 
 
@@ -118,7 +122,7 @@ class ToyVanilla(nn.Module):
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=True)  # untied
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # untied
 
         pe = sinusoidal_encoding(config.block_size, config.n_embd,
                                  torch.device(config.device))
@@ -128,11 +132,15 @@ class ToyVanilla(nn.Module):
         print(f"number of parameters: {self.num_params()/1e6:.3f}M")
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=1.0, std=0.02)
-            #torch.nn.init.ones_(module.weight)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+        if isinstance(module, nn.Linear):
+            torch.nn.init.zeros_(module.weight)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+        # elif isinstance(module, nn.Embedding):
+        #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+
 
     def num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -169,14 +177,19 @@ class ToyVanilla(nn.Module):
             x = block(x)
         if targets is not None:
             logits = self.lm_head(x)
-            if self.config.loss_type == "mse":
+            if self.config.loss_type in ("mse", "mse_rep"):
                 flat = logits.view(-1, logits.size(-1))
                 tgt = targets.view(-1)
                 mask = tgt != -1                       # drop ignore_index=-1
                 flat = flat[mask]
                 tgt = tgt[mask]
                 onehot = F.one_hot(tgt, num_classes=flat.size(-1)).to(flat.dtype)
-                loss = F.mse_loss(flat, onehot)
+                if self.config.loss_type == "mse_rep":
+                    # replication convention: 0.5 * per-position SUM over
+                    # classes, averaged over positions (empirical-pi weighting)
+                    loss = 0.5 * (flat - onehot).pow(2).sum(dim=-1).mean()
+                else:
+                    loss = F.mse_loss(flat, onehot)
             else:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                        targets.view(-1), ignore_index=-1)
