@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import csv
+import inspect
 from dataclasses import asdict
 
 # Cap CPU threads (only matters for the CPU path; harmless on GPU).
@@ -193,12 +194,47 @@ def main():
     if is_master:
         print("checkpoint schedule (iter -> tag):", ckpt_iters)
 
+    try:
+        init_src = inspect.getsource(type(raw_model)._init_weights)
+    except (OSError, TypeError):
+        init_src = None
+
     def save_ckpt(tag, it):
         path = os.path.join(out_dir, f"ckpt_{tag}.pt")
         torch.save({"model": raw_model.state_dict(), "iter_num": it,
                     "tag": tag, "config": model_cfg.__dict__,
+                    "init_src": init_src,
                     "experiment": asdict(cfg)}, path)
         print(f"  saved checkpoint {path} (iter {it})")
+
+    # ---- in-training rep_groups: per-frequency-group train loss -------------
+    # 0-layer linear models on dual-stream data only: the full-batch train loss
+    # is closed-form in the unique (x, y) pair counts (see plot_rep_groups.py),
+    # so each checkpoint tag costs one V x V matmul on rank 0. Written to
+    # rep_groups.csv + rep_groups.png at the end of training -- replaces the
+    # post-hoc eval_ckpts_val_by_freq.py step in the SCO jobs.
+    rep = None
+    if is_master and model_cfg.n_layer == 0 and data_format == "dual_stream" \
+            and model_cfg.loss_type in ("mse", "mse_rep"):
+        import plot_rep_groups as rg
+        print("[rep_groups] loading pair stats ...", flush=True)
+        _ps = rg.load_pair_stats(dataset)
+        rep = {"rg": rg, "ps": _ps,
+               "groups": rg.freq_groups(_ps["pi"], rg.N_GROUPS),
+               "scale": 2.0 / _ps["V"] if model_cfg.loss_type == "mse" else 1.0,
+               "rows": []}
+
+    def rep_record(tag, it):
+        rg, ps = rep["rg"], rep["ps"]
+        state = {k: v.detach().float().cpu()
+                 for k, v in raw_model.state_dict().items()}
+        lx = rg.per_x_losses(state, ps, model_cfg.__dict__) * rep["scale"]
+        rho = ps["rho"]
+        gl = [float(lx[g].sum() / max(rho[g].sum(), 1e-300))
+              for g in rep["groups"]]
+        rep["rows"].append((tag, it, float(lx.sum()), gl))
+        print(f"  rep_groups {tag} (iter {it}): total {float(lx.sum()):.4e}",
+              flush=True)
 
     log_path = os.path.join(out_dir, "loss_log.csv")
     val_log_path = os.path.join(out_dir, "val_loss_log.csv")
@@ -214,6 +250,8 @@ def main():
 
         if is_master and it in iter_to_tag:
             save_ckpt(iter_to_tag[it], it)
+            if rep is not None:
+                rep_record(iter_to_tag[it], it)
 
         if it % eval_interval == 0 and is_master:
             vloss = eval_val()
@@ -257,7 +295,9 @@ def main():
             if val_rows:
                 plt.plot([r[0] for r in val_rows], [r[1] for r in val_rows],
                          lw=1.2, marker="o", ms=3, label="val")
-            loss_label = "MSE (vs one-hot)" if cfg.model.loss_type == "mse" else "cross-entropy"
+            loss_label = {"mse": "MSE (vs one-hot)",
+                          "mse_rep": "0.5*sum sq. err (rep)"}.get(
+                              cfg.model.loss_type, "cross-entropy")
             plt.xlabel("iteration"); plt.ylabel(f"loss ({loss_label})")
             plt.title(f"{cfg.train.run_name} loss")
             plt.legend()
@@ -265,6 +305,26 @@ def main():
             fig_path = os.path.join(out_dir, "loss_curve.png")
             plt.savefig(fig_path, dpi=150); plt.close()
             print("wrote", fig_path)
+
+        if rep is not None and rep["rows"]:
+            rg, ps = rep["rg"], rep["ps"]
+            rows = sorted(rep["rows"], key=lambda r: r[1])
+            csv_path = os.path.join(out_dir, "rep_groups.csv")
+            with open(csv_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["tag", "iter", "total_loss"]
+                           + [f"group_{g}" for g in range(len(rep["groups"]))])
+                for tag, it, total, gl in rows:
+                    w.writerow([tag, it, f"{total:.10e}"]
+                               + [f"{v:.10e}" for v in gl])
+            rho = ps["rho"]
+            gfloor = [float(ps["floor"][g].sum()
+                            / max(rho[g].sum(), 1e-300)) * rep["scale"]
+                      for g in rep["groups"]]
+            rg.plot_single_run(cfg.train.run_name, out_dir, rows, rep["groups"],
+                               gfloor, rg.opt_desc(asdict(cfg)), dataset,
+                               model_cfg.loss_type)
+            print("wrote", csv_path, "and rep_groups.png")
 
     if is_ddp:
         dist.barrier()
