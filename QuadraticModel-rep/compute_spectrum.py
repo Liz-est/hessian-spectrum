@@ -1,4 +1,6 @@
 """
+单节点的历史脚本，用的是瞬时二阶矩而不是EMA
+
 Lanczos 谱计算驱动（单 checkpoint，4 矩阵类型）
 
 对一个 checkpoint 计算 4 条谱曲线（论文 Figure 2 约定）：

@@ -18,7 +18,7 @@ out=$($SCO acp jobs create \
   --container-image-url "registry.cn-sh-01.sensecore.cn/ccr-zhicheng-04/zkx-ssh-install-g:main-20260515065803" \
   --storage-mount "01995892-d478-76d8-aec7-13fd8284477e:/data" \
   --job-name "spectrum-ddp-p10" \
-  --command "bash /data/250010020/hessian-spectrum/QuadraticModel-rep/run_spectrum_ddp_inner.sh p10 > /data/250010020/hessian-spectrum/QuadraticModel-rep/test_outputs/spectrum_ddp_p10.log 2>&1" \
+  --command "bash /data/250010020/hessian-spectrum/QuadraticModel-rep/run_spectrum_ddp_inner.sh p10 2>&1 | tee /data/250010020/hessian-spectrum/QuadraticModel-rep/test_outputs/spectrum_ddp_p10.log 2>&1" \
   2>&1)
 
 echo "$out"

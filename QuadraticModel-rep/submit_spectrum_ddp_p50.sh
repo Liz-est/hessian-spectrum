@@ -4,10 +4,10 @@ cd /data/250010020/hessian-spectrum/QuadraticModel-rep
 SCO="/root/.sco/bin/sco --profile zhanglixian-g"
 WS="p10-intelligent-adaptation-and-optimization-for-domestic-ai"
 
-# 检查是否已提交
-if $SCO acp jobs list --workspace-name "$WS" 2>/dev/null | grep -q "spectrum-ddp-p50"; then
-  echo "job 已存在，跳过"; exit 0
-fi
+# # 检查是否已提交
+# if $SCO acp jobs list --workspace-name "$WS" 2>/dev/null | grep -q "spectrum-ddp-p50"; then
+#   echo "job 已存在，跳过"; exit 0
+# fi
 
 out=$($SCO acp jobs create \
   --workspace-name "$WS" \
@@ -18,7 +18,7 @@ out=$($SCO acp jobs create \
   --container-image-url "registry.cn-sh-01.sensecore.cn/ccr-zhicheng-04/zkx-ssh-install-g:main-20260515065803" \
   --storage-mount "01995892-d478-76d8-aec7-13fd8284477e:/data" \
   --job-name "spectrum-ddp-p50" \
-  --command "bash /data/250010020/hessian-spectrum/QuadraticModel-rep/run_spectrum_ddp_inner.sh p50 > /data/250010020/hessian-spectrum/QuadraticModel-rep/test_outputs/spectrum_ddp_p50.log 2>&1" \
+  --command "bash /data/250010020/hessian-spectrum/QuadraticModel-rep/run_spectrum_ddp_inner.sh p50 2>&1 | tee /data/250010020/hessian-spectrum/QuadraticModel-rep/test_outputs/spectrum_ddp_p50.log 2>&1" \
   2>&1)
 
 echo "$out"

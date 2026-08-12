@@ -133,15 +133,18 @@ def load_checkpoint(path, ema_key, device):
 # --------------------------------------------------------------------------
 # 数据：每 rank 只采自己那一份 batch（HVP batch 并行）
 # --------------------------------------------------------------------------
-def make_local_batches(cfg, n_tokens, world, rank, device, seed):
+def make_local_batches(cfg, n_tokens, world, rank, device, seed, per=8):
     """
     全局要过 n_tokens，每 rank 分 1/world。用 rank 相关 seed 保证不同 rank 采不同数据。
     返回 (local_batches, global_nbatch)：global_nbatch 用于 HVP 求和后归一化。
+
+    per：每 minibatch 序列数。仅影响单次双反向 HVP 的**激活峰值显存**，不改总
+    token 数/计算量/通信次数（per 越小 → nb 越多，逐 minibatch 累加）。Q 上 GPU 后
+    显存吃紧时调小 per 即可（16 卡 Q≈50GB，per=8 的 HVP 峰值会顶穿 80GB）。
     """
     data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
     seq = cfg.seq_len
     n_seqs_global = max(world, n_tokens // seq)
-    per = 8  # 每 minibatch 8 条序列，控显存
     # 全局 minibatch 数（向上取到 world 的倍数，便于均分）
     nb_global = max(world, (n_seqs_global + per - 1) // per)
     nb_global = ((nb_global + world - 1) // world) * world
@@ -181,17 +184,38 @@ def make_dist_hvp(model, local_batches, nb_global, kind, precond, device):
 #   分片只用于存储与重正交的向量运算。
 # --------------------------------------------------------------------------
 def lanczos_sharded(hvp_fn, n_params, m, world, rank, bounds, device,
-                    store_device, seed, dtype=torch.float32):
+                    store_device, seed, dtype=torch.float32, hvp_reserve_bytes=None):
     s0, s1 = bounds[rank]
     shard = s1 - s0
+
+    # ---- Q 分片放哪：优先 GPU（消掉 CPU 重正交 + CPU↔GPU 搬运这条串行谷）----
+    # Q_local(m×shard) fp32 的字节数；只有 GPU 空闲显存能同时容纳 Q + HVP 双反向峰值
+    # 才上 GPU，否则回退 CPU（8 卡 shard 太大 Q≈100GB 装不下；16 卡 Q≈50GB 可放，
+    # 但 per=8 的 HVP 峰值≈26GB 会顶穿 → 必须配合调小 per，见 hvp_reserve_bytes）。
+    q_bytes = m * shard * 4
+    # HVP 峰值保留量：默认给足 per=8 的实测峰值 ~26GB；main 会按实际 per 传更小的值。
+    HVP_MARGIN = hvp_reserve_bytes if hvp_reserve_bytes is not None else 28 * 1024**3
+    if device.type == "cuda":
+        free, _ = torch.cuda.mem_get_info(device)
+        if q_bytes + HVP_MARGIN <= free:
+            q_device = device
+        else:
+            q_device = store_device
+            log_all(f"⚠ 显存不足放 Q({q_bytes/1e9:.0f}GB)+HVP保留({HVP_MARGIN/1e9:.0f}GB)"
+                    f">空闲({free/1e9:.0f}GB)，Q 回退 CPU")
+    else:
+        q_device = store_device
+    log(f"  Q_local 放置: {q_device}  (fp32 {q_bytes/1e9:.1f}GB/rank, "
+        f"HVP保留 {HVP_MARGIN/1e9:.0f}GB)")
 
     # 初始随机向量：所有 rank 用同一 seed 生成**完整** v0 后各取自己片，保证一致
     torch.manual_seed(seed)
     v_full = torch.randn(n_params, dtype=dtype, device=store_device)
     v_full = v_full / v_full.norm()
-    v_local = v_full[s0:s1].clone()
+    v_local = v_full[s0:s1].to(q_device)
+    del v_full
 
-    Q = torch.zeros(m, shard, dtype=dtype, device=store_device)
+    Q = torch.zeros(m, shard, dtype=dtype, device=q_device)
     Q[0] = v_local
 
     alpha = np.zeros(m, dtype=np.float64)
@@ -211,21 +235,22 @@ def lanczos_sharded(hvp_fn, n_params, m, world, rank, bounds, device,
         # w = H · v_j（需要完整 v_j → all_gather Q[j] 片）
         v_full = gather_full(Q[j])
         w_full = hvp_fn(v_full)            # 完整 (n_params,) 在 device
-        w = w_full[s0:s1].to(store_device) # 只留自己片
+        w = w_full[s0:s1].to(q_device).clone()  # 只留自己片；clone 断开对 w_full 的视图，del 才能回收整向量
         del v_full, w_full
 
-        # α_j = <w, q_j> 全局：局部 dot 后 all_reduce
-        # ⚠ NCCL 只支持 GPU tensor，CPU scalar 需先搬到 device
+        # α_j = <w, q_j> 全局：局部 dot（在 q_device）后搬到 device 做 all_reduce
+        # ⚠ NCCL 只支持 GPU tensor；q_device==device 时 .to 为 no-op
         a_local = torch.dot(w, Q[j]).to(device)
         dist.all_reduce(a_local, op=dist.ReduceOp.SUM)
         alpha[j] = a_local.item()
 
         # 全重正交（DGKS 两轮）：coeff = Q_local·w（(j+1,)），all_reduce 求全局
+        # Q 在 GPU 时 mv/axpy 全在 GPU，消掉原 CPU 串行重正交谷
         Qv = Q[: j + 1]
         for _ in range(2):
             coeff = torch.mv(Qv, w).to(device)  # NCCL 需要 GPU tensor
             dist.all_reduce(coeff, op=dist.ReduceOp.SUM)
-            w = w - torch.mv(Qv.t(), coeff.to(store_device))
+            w = w - torch.mv(Qv.t(), coeff.to(q_device))
 
         # β_j = ‖w‖ 全局
         b_local = torch.dot(w, w).to(device)  # NCCL 需要 GPU tensor
@@ -263,6 +288,9 @@ def main():
     ap.add_argument("--n_tokens", type=int, default=1_000_000, help="全局 HVP 采样 token 数")
     ap.add_argument("--ema", type=float, default=0.04)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--per", type=int, default=8,
+                    help="每 minibatch 序列数；仅控 HVP 双反向激活峰值，不改总 token/计算量。"
+                         "Q 上 GPU 后显存吃紧就调小（16 卡建议 2）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--backend", default="nccl", choices=["nccl", "gloo"])
     ap.add_argument("--cpu", action="store_true", help="强制 CPU（本地 sanity）")
@@ -287,9 +315,9 @@ def main():
     log(f"  n_params={n_params:,}  每 rank shard≈{(s1-s0):,}  "
         f"Q_local(m={args.m},fp32)={args.m*(s1-s0)*4/1e9:.1f}GB/rank")
 
-    local_batches, nb_global = make_local_batches(cfg, args.n_tokens, world, rank, device, args.seed)
-    tokens_actual = nb_global * 8 * cfg.seq_len
-    log(f"  HVP: nb_global={nb_global} minibatch × 8 × {cfg.seq_len} = {tokens_actual:,} tokens")
+    local_batches, nb_global = make_local_batches(cfg, args.n_tokens, world, rank, device, args.seed, per=args.per)
+    tokens_actual = nb_global * args.per * cfg.seq_len
+    log(f"  HVP: nb_global={nb_global} minibatch × {args.per} × {cfg.seq_len} = {tokens_actual:,} tokens")
 
     CURVES = [("gn", True, "gn_adam"), ("hessian", True, "hessian_adam"),
               ("gn", False, "gn_sgd"), ("hessian", False, "hessian_sgd")]
@@ -297,6 +325,9 @@ def main():
     out = {"m": args.m, "n_params": n_params, "n_tokens": tokens_actual, "ema": args.ema}
     if is_master():
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+
+    # HVP 双反向峰值随 per 近线性（per=8 实测≈26GB → ≈3.3GB/seq）；留 4GB 底 + 通信缓冲。
+    hvp_reserve = int((args.per * 3.4 + 4) * 1024**3)
 
     for kind, use_p, tag in CURVES:
         dist.barrier()
@@ -306,7 +337,7 @@ def main():
         hvp_fn = make_dist_hvp(model, local_batches, nb_global, kind, p, device)
         eigs, weights, alpha, beta = lanczos_sharded(
             hvp_fn, n_params, args.m, world, rank, bounds, device,
-            store_device, args.seed)
+            store_device, args.seed, hvp_reserve_bytes=hvp_reserve)
         dist.barrier()
         dt = time.time() - t0
         log_all(f"曲线 {tag} 完成，耗时 {dt:.0f}s")
