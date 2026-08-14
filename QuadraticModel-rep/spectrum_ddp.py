@@ -121,13 +121,17 @@ def load_checkpoint(path, ema_key, device):
         used_nu = "last ν"
     eps = opt["eps"]
     lr_groups = {name: (pre, post) for name, _, pre, post in model.lr_groups()}
-    precond = {}
+    precond = {}       # Adam：√(pre·post/(√ν̂+eps))
+    precond_raw = {}   # raw：CompleteP 每层 lr 形状乘子 √(pre·post)（无 Adam 的 ν）
     for name, _ in model.named_parameters():
         pre, post = lr_groups[name]
         nu_hat = nu_src[name].to(device).float() / denom_b2
         precond[name] = torch.sqrt(pre * post / (torch.sqrt(nu_hat) + eps))
+        # 论文的 "raw" 谱 = CompleteP-only 预条件（每层 lr 形状乘子，无 Adam 的 ν）。
+        # 已验证：这样 λmax≈1.2，与论文 raw(~0.34) 同量级(~4×)；纯裸 H 会被数据钉死(~22, 64×)。
+        precond_raw[name] = torch.sqrt(torch.tensor(pre * post, device=device, dtype=torch.float32))
     log(f"  {used}; {used_nu}")
-    return model, cfg, precond
+    return model, cfg, precond, precond_raw
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +297,9 @@ def main():
                          "Q 上 GPU 后显存吃紧就调小（16 卡建议 2）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--backend", default="nccl", choices=["nccl", "gloo"])
+    ap.add_argument("--curves", default="all",
+                    help="只跑哪些曲线（逗号分隔 tag，如 'gn_raw,hessian_raw'）；"
+                         "默认 all=四条全跑。")
     ap.add_argument("--cpu", action="store_true", help="强制 CPU（本地 sanity）")
     args = ap.parse_args()
 
@@ -308,7 +315,7 @@ def main():
     log(f"world={world} backend={args.backend} device={device}")
     log(f"m={args.m}  n_tokens={args.n_tokens}  ema={args.ema}  ckpt={args.ckpt}")
 
-    model, cfg, precond = load_checkpoint(args.ckpt, args.ema, device)
+    model, cfg, precond, precond_raw = load_checkpoint(args.ckpt, args.ema, device)
     n_params = model.n_params()
     bounds = shard_bounds(n_params, world)
     s0, s1 = bounds[rank]
@@ -319,20 +326,37 @@ def main():
     tokens_actual = nb_global * args.per * cfg.seq_len
     log(f"  HVP: nb_global={nb_global} minibatch × {args.per} × {cfg.seq_len} = {tokens_actual:,} tokens")
 
-    CURVES = [("gn", True, "gn_adam"), ("hessian", True, "hessian_adam"),
-              ("gn", False, "gn_sgd"), ("hessian", False, "hessian_sgd")]
+    # 每条曲线的预条件选择器："adam"=Adam P √(pre·post/(√ν̂+eps))；"raw"=CompleteP √(pre·post)（无 ν）。
+    # 论文的 "raw" 曲线就是 CompleteP-only（已验证 λmax 与论文同量级）。
+    # tag 用 gn_raw/hessian_raw（我们自己的命名，非真 SGD）。论文缓存那边写死叫 gn_sgd，
+    # 只在画图脚本 plot_compare_running.py 里把 raw 映射到论文的 B64_P100_*_sgd key。
+    CURVES = [("gn", "adam", "gn_adam"), ("hessian", "adam", "hessian_adam"),
+              ("gn", "raw", "gn_raw"), ("hessian", "raw", "hessian_raw")]
+    if args.curves != "all":
+        want = {c.strip() for c in args.curves.split(",") if c.strip()}
+        unknown = want - {t for _, _, t in CURVES}
+        if unknown:
+            raise SystemExit(f"未知曲线 tag: {unknown}；可选 {[t for *_,t in CURVES]}")
+        CURVES = [c for c in CURVES if c[2] in want]
+        log(f"  只跑曲线: {[t for *_,t in CURVES]}")
 
-    out = {"m": args.m, "n_params": n_params, "n_tokens": tokens_actual, "ema": args.ema}
+    def resolve_precond(sel):
+        return precond if sel == "adam" else precond_raw
+
+    log("  raw 曲线预条件: CompleteP √(pre·post)（含每层 lr 乘子、无 Adam ν）")
+
+    out = {"m": args.m, "n_params": n_params, "n_tokens": tokens_actual, "ema": args.ema,
+           "raw_precond": "completep"}
     if is_master():
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     # HVP 双反向峰值随 per 近线性（per=8 实测≈26GB → ≈3.3GB/seq）；留 4GB 底 + 通信缓冲。
     hvp_reserve = int((args.per * 3.4 + 4) * 1024**3)
 
-    for kind, use_p, tag in CURVES:
+    for kind, sel, tag in CURVES:
         dist.barrier()
         t0 = time.time()
-        p = precond if use_p else None
+        p = resolve_precond(sel)
         log(f"\n=== 曲线 {tag} 开始 ===")
         hvp_fn = make_dist_hvp(model, local_batches, nb_global, kind, p, device)
         eigs, weights, alpha, beta = lanczos_sharded(

@@ -1,8 +1,14 @@
 """
 按论文 combined_positive 逻辑重画：locked 正端 + 连续体合并 → 按 index 排序 → 去重 → 单条线。
-解决本仓库 npz 里 locked 与连续体在 index 空间重叠导致的「双线分叉」。
-误差带仍来自连续体 lo/hi。叠加论文 B64_P100（同样 combined）。
+误差带来自连续体 lo/hi。叠加论文 B64_P100（同样 combined）。
+
+raw 两条曲线（我们内部 tag gn_raw/hessian_raw，非真 SGD）：论文的 "raw" 实为 CompleteP 预条件
+√(pre·post)，非纯裸 H/G（已验证：CompleteP 后 λmax≈1.2，与论文 raw≈0.34 同量级 ~4×；纯裸会到
+~22, 64×）。故 raw 面板从 CompleteP 版 npz 取数（spectrum_ddp_p100_m1200_raw_completep.npz）。
+⚠ 论文缓存里这两条写死叫 B64_P100_gn_sgd/hessian_sgd（别人的数据、key 不可改），故仅在本脚本里
+把我们的 raw tag 映射到论文的 sgd key（见 PANELS 的 paper_key 字段）。adam 两条不变。
 """
+import os
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -11,8 +17,13 @@ from matplotlib.ticker import FixedLocator
 from matplotlib.lines import Line2D
 
 N = 167_772_160
-ours = np.load("outputs/spectrum_ddp_p100_m1200_reband.npz", allow_pickle=True)
-paper = np.load("../QuadraticModel/analysis/data/cache/spectrum_3x3.npz", allow_pickle=True)
+ours = np.load("QuadraticModel-rep/outputs/spectrum_ddp_p100_m1200_reband.npz", allow_pickle=True)
+paper = np.load("QuadraticModel/analysis/data/cache/spectrum_3x3.npz", allow_pickle=True)
+# raw 曲线固定从 CompleteP 版 npz 取（我们内部 tag gn_raw/hessian_raw）
+_CP_PATH = "QuadraticModel-rep/outputs/spectrum_ddp_p100_m1200_raw_completep.npz"
+if not os.path.exists(_CP_PATH):
+    raise SystemExit(f"缺少 CompleteP raw 谱 {_CP_PATH}（先跑 run_spectrum_ddp_raw_completep.sh）")
+ours_cp = np.load(_CP_PATH, allow_pickle=True)
 COL_O, COL_P = "#0072B2", "#d62728"
 
 
@@ -46,17 +57,19 @@ def draw(ax, cur, color, label, band_alpha=0.10):
     ax.fill_betweenx(g[q], lo[q], hi[q], color=color, alpha=band_alpha, lw=0)
 
 
-# (curve, title, y-top). raw GN 量级 ~22，需比 precond(~1.8) 高的天花板。
+# (our-tag, title, y-top, source-npz, paper-key-suffix). raw 用 CompleteP 版 → λ 被压到 O(1)，y-top 5e0。
+# paper-key-suffix：论文缓存写死的 key 后缀（B64_P100_<suffix>）；raw 曲线论文那边叫 sgd。
 PANELS = [
-    ("gn_adam", "Preconditioned Gauss-Newton", 5e0),
-    ("hessian_adam", "Preconditioned Hessian", 5e0),
-    ("gn_sgd", "Raw Gauss-Newton", 1e2),
-    ("hessian_sgd", "Raw Hessian", 1e2),
+    ("gn_adam", "Preconditioned Gauss-Newton", 5e0, ours, "gn_adam"),
+    ("hessian_adam", "Preconditioned Hessian", 5e0, ours, "hessian_adam"),
+    ("gn_raw", "Raw Gauss-Newton (CompleteP)", 5e0, ours_cp, "gn_sgd"),
+    ("hessian_raw", "Raw Hessian (CompleteP)", 5e0, ours_cp, "hessian_sgd"),
 ]
-have = [p for p in PANELS if f"{p[0]}_x" in ours.files]
+
+have = [p for p in PANELS if f"{p[0]}_x" in p[3].files]
 fig, axes = plt.subplots(1, len(have), figsize=(5.2 * len(have), 4.3), squeeze=False)
-for ax, (c, t, ytop) in zip(axes[0], have):
-    oc = get(ours, c); pc = get(paper, f"B64_P100_{c}")
+for ax, (c, t, ytop, src, pkey) in zip(axes[0], have):
+    oc = get(src, c); pc = get(paper, f"B64_P100_{pkey}")
     draw(ax, oc, COL_O, "Ours")
     draw(ax, pc, COL_P, "Paper B64_P100")
     lo_max = float(combined_positive(oc)[1].max())
@@ -71,6 +84,6 @@ for ax, (c, t, ytop) in zip(axes[0], have):
 fig.supxlabel("eigenvalue index (rank)", fontsize=10)
 fig.supylabel("eigenvalue", fontsize=10)
 fig.tight_layout()
-out = "outputs/compare_p100_m1200_v6_reband.png"
+out = "QuadraticModel-rep/outputs/compare_p100_m1200_v7_raw_completep.png"
 fig.savefig(out, dpi=140, bbox_inches="tight")
 print("saved:", out)
