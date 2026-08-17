@@ -28,8 +28,10 @@ from opt import CompletePAdam
 from hvp import hessian_vector_product, gauss_newton_vector_product, build_adam_preconditioner
 from lanczos import lanczos_algorithm_1
 from gauss_radau import compute_spectrum_with_error_bands
+from data_grain import make_hvp_batches
 
-DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_bpe8192"
+# 100BT parquet：谱分析 HVP 用与训练/原版谱脚本相同的 grain 采样。
+DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_100B_parquet/sample/100BT"
 N_PARAMS = 167_772_160
 
 
@@ -77,36 +79,24 @@ def build_adam_precond_from_ckpt(opt_state, model, device):
     return precond
 
 
-def make_data_loader(batch, seq, device, seed):
-    """简单的随机采样器。"""
-    data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
-    g = torch.Generator().manual_seed(seed)
-    n = len(data)
-    def sample():
-        ix = torch.randint(n - seq - 1, (batch,), generator=g)
-        x = torch.stack([torch.from_numpy(data[i:i+seq].astype(np.int64)) for i in ix]).to(device)
-        y = torch.stack([torch.from_numpy(data[i+1:i+1+seq].astype(np.int64)) for i in ix]).to(device)
-        return x, y
-    return sample
-
-
-def build_hvp_fn(model, data_fn, n_batches, curvature, preconditioner, device):
-    """构建批平均的 HVP 函数（curvature='gn'/'hessian', preconditioner=None/dict）。"""
+def build_hvp_fn(model, batches, curvature, preconditioner, device):
+    """构建批平均的 HVP 函数（curvature='gn'/'hessian', preconditioner=None/dict）。
+    batches 为 make_hvp_batches 预采样的固定 minibatch 列表（grain 采样），
+    HVP 在其上求和后除以 minibatch 数——每次 Lanczos matvec 用同一批数据。"""
     def hvp(v):
         acc = torch.zeros_like(v)
-        for _ in range(n_batches):
-            x, y = data_fn()
+        for x, y in batches:
             if curvature == "gn":
                 acc += gauss_newton_vector_product(model, x, y, v, preconditioner=preconditioner)
             else:
                 acc += hessian_vector_product(model, x, y, v, preconditioner=preconditioner)
-        return acc / n_batches
+        return acc / len(batches)
     return hvp
 
 
-def compute_one_curve(model, data_fn, n_batches, m, curvature, preconditioner, device, seed):
+def compute_one_curve(model, batches, m, curvature, preconditioner, device, seed):
     """计算一条谱曲线（Lanczos + Gauss-Radau）。"""
-    hvp_fn = build_hvp_fn(model, data_fn, n_batches, curvature, preconditioner, device)
+    hvp_fn = build_hvp_fn(model, batches, curvature, preconditioner, device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Running Lanczos m={m} for {curvature} {'Adam' if preconditioner else 'raw'}...", flush=True)
     t0 = time.time()
@@ -133,11 +123,15 @@ def main():
     print(f"Loading checkpoint {args.ckpt_path} on {device}...", flush=True)
     model, opt_state, cfg = load_checkpoint(args.ckpt_path, device)
     seq = cfg["seq_len"]
-    n_batches = args.n_tokens // (args.batch * seq)
     print(f"Model: {cfg['D']}D {cfg['L']}L, n_params={sum(p.numel() for p in model.parameters()):,}", flush=True)
-    print(f"HVP: {n_batches} batches × {args.batch}×{seq} = {n_batches*args.batch*seq} tokens", flush=True)
 
-    data_fn = make_data_loader(args.batch, seq, device, args.seed)
+    # grain 采样 HVP batch（与训练/原版谱脚本同一条 seed 流，shuffle=True+repeat）。
+    # args.batch = 每个 HVP minibatch 的序列数（原版 run_dist 的 batch_size，默认小以控显存）。
+    batches, n_seqs = make_hvp_batches(
+        data_dir=DATA_DIR, seq_len=seq, vocab_size=cfg["V"],
+        n_tokens=args.n_tokens, per=args.batch, device=device, seed=args.seed)
+    print(f"HVP: {len(batches)} minibatch × {args.batch}×{seq} = {n_seqs*seq} tokens "
+          f"(grain 采样，从流首取；未做原版的 iter.set_state / frob2 过滤)", flush=True)
     adam_precond = build_adam_precond_from_ckpt(opt_state, model, device)
 
     # 4 条曲线（论文 Figure 2 约定）
@@ -150,13 +144,13 @@ def main():
 
     results = {}
     for curvature, precond, label in curves:
-        spec, dt = compute_one_curve(model, data_fn, n_batches, args.m, curvature, precond, device, args.seed)
+        spec, dt = compute_one_curve(model, batches, args.m, curvature, precond, device, args.seed)
         for k in ("g", "lo", "hi", "mid", "L", "R", "cut", "x", "y", "dot_x"):
             results[f"{label}_{k}"] = spec[k]
         print(f"  [{label}] done: {dt:.1f}s, cut={spec['cut']}, mid range=[{spec['mid'].min():.1f}, {spec['mid'].max():.3e}]", flush=True)
 
     results["m"] = args.m
-    results["n_tokens"] = n_batches * args.batch * seq
+    results["n_tokens"] = n_seqs * seq
     np.savez(args.out, **results)
     print(f"\n✓ Saved {args.out}")
 

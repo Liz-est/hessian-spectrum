@@ -26,8 +26,10 @@ from model import Transformer, TransformerConfig, param_group_slices
 from hvp import hessian_vector_product, gauss_newton_vector_product
 from lanczos import lanczos_algorithm_1
 from gauss_radau import compute_spectrum_with_error_bands
+from data_grain import make_hvp_batches
 
-DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_bpe8192"
+# 100BT parquet：HVP 用与训练/原版谱脚本相同的 grain 采样。
+DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_100B_parquet/sample/100BT"
 
 
 def load_checkpoint(path, ema_key, device):
@@ -70,20 +72,11 @@ def load_checkpoint(path, ema_key, device):
 
 
 def make_batches(cfg, n_tokens, device, seed):
-    """从 val/train 流采样固定 batch 集，HVP 上平均。"""
-    data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
-    seq = cfg.seq_len
-    n_seqs = max(1, n_tokens // seq)
-    g = torch.Generator().manual_seed(seed)
-    batches = []
-    # 每 batch 8 条序列，控显存
-    per = 8
-    for s in range(0, n_seqs, per):
-        bs = min(per, n_seqs - s)
-        ix = torch.randint(len(data) - seq - 1, (bs,), generator=g)
-        x = torch.stack([torch.from_numpy(data[i:i+seq].astype(np.int64)) for i in ix]).to(device)
-        y = torch.stack([torch.from_numpy(data[i+1:i+1+seq].astype(np.int64)) for i in ix]).to(device)
-        batches.append((x, y))
+    """从训练同一条 grain 流采样固定 batch 集，HVP 上平均（每 minibatch 8 条序列控显存）。
+    grain 采样口径与原版 analysis/spectrum 一致（seed 全局 shuffle + repeat + concat-split）。"""
+    batches, _n = make_hvp_batches(
+        data_dir=DATA_DIR, seq_len=cfg.seq_len, vocab_size=cfg.V,
+        n_tokens=n_tokens, per=8, device=device, seed=seed)
     return batches
 
 

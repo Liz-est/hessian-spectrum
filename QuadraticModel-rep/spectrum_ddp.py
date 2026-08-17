@@ -39,8 +39,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 from model import Transformer, TransformerConfig
 from hvp import hessian_vector_product, gauss_newton_vector_product
 from gauss_radau import compute_spectrum_with_error_bands
+from data_grain import make_hvp_batches
 
-DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_bpe8192_clean"
+# 100BT parquet：HVP 用与训练/原版谱脚本相同的 grain 采样。
+DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_100B_parquet/sample/100BT"
 
 
 # --------------------------------------------------------------------------
@@ -139,28 +141,36 @@ def load_checkpoint(path, ema_key, device):
 # --------------------------------------------------------------------------
 def make_local_batches(cfg, n_tokens, world, rank, device, seed, per=8):
     """
-    全局要过 n_tokens，每 rank 分 1/world。用 rank 相关 seed 保证不同 rank 采不同数据。
-    返回 (local_batches, global_nbatch)：global_nbatch 用于 HVP 求和后归一化。
+    全局要过 n_tokens，从**训练同一条 grain 流**（seed 全局 shuffle + repeat +
+    concat-split）顺序取 nb_global 个完整 minibatch（每个 per 条序列），再把这些
+    minibatch **整块**分给各 rank：rank r 拿 [r*nb_local:(r+1)*nb_local]。
+    返回 (local_batches, nb_global)：nb_global 用于 HVP all_reduce 求和后归一化。
 
-    per：每 minibatch 序列数。仅影响单次双反向 HVP 的**激活峰值显存**，不改总
-    token 数/计算量/通信次数（per 越小 → nb 越多，逐 minibatch 累加）。Q 上 GPU 后
-    显存吃紧时调小 per 即可（16 卡 Q≈50GB，per=8 的 HVP 峰值会顶穿 80GB）。
+    ⚠ 为何整块分而非在 minibatch 内按行切：模型 loss 是 mean reduction，单个
+    minibatch 的 HVP 已是该 minibatch 的**逐 token 均值**。各 rank 持有不同的完整
+    minibatch，all_reduce 求和得 Σ(每 minibatch 均值)，再 /nb_global = 全局 grand
+    mean（与原版单 mesh 大 batch 的均值等价）。若在 minibatch 内按行切、各 rank 只算
+    自己那几行的均值再求和，则每个均值分母错了，结果偏差 world 倍。
+
+    per：每 minibatch 序列数，仅影响单次双反向 HVP 的激活峰值显存，不改总 token/
+    计算量。Q 上 GPU 后显存吃紧调小即可。
+
+    数据口径同 compute_spectrum/run_spectrum_b64：从流首取（rep 未落 grain 迭代器
+    状态，无法复刻原版 iter.set_state 到 checkpoint 数据位置；也未做 frob2 过滤）。
+    所有 rank 用同一 seed 迭代同一条流并保留各自 minibatch 块，全局样本集与单流一致。
     """
-    data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")
     seq = cfg.seq_len
-    n_seqs_global = max(world, n_tokens // seq)
-    # 全局 minibatch 数（向上取到 world 的倍数，便于均分）
-    nb_global = max(world, (n_seqs_global + per - 1) // per)
-    nb_global = ((nb_global + world - 1) // world) * world
+    n_minibatch = max(world, n_tokens // seq // per)
+    # 向上取到 world 的倍数，便于整块均分
+    nb_global = ((n_minibatch + world - 1) // world) * world
     nb_local = nb_global // world
 
-    g = torch.Generator().manual_seed(seed + 9973 * rank)
-    batches = []
-    for _ in range(nb_local):
-        ix = torch.randint(len(data) - seq - 1, (per,), generator=g)
-        x = torch.stack([torch.from_numpy(data[i:i+seq].astype(np.int64)) for i in ix]).to(device)
-        y = torch.stack([torch.from_numpy(data[i+1:i+1+seq].astype(np.int64)) for i in ix]).to(device)
-        batches.append((x, y))
+    # 单流（world=1，不做行切）取全部 nb_global 个 per-序列 minibatch，各 rank 留自己块。
+    all_batches, _n = make_hvp_batches(
+        data_dir=DATA_DIR, seq_len=seq, vocab_size=cfg.V,
+        n_tokens=nb_global * per * seq, per=per, device=device, seed=seed)
+    s = rank * nb_local
+    batches = all_batches[s:s + nb_local]
     return batches, nb_global
 
 
@@ -279,6 +289,15 @@ def lanczos_sharded(hvp_fn, n_params, m, world, rank, bounds, device,
         T[np.arange(1, m), np.arange(m - 1)] = beta
     eigvals, U = np.linalg.eigh(T)
     weights = U[0, :] ** 2
+
+    # ★ Q 在本曲线之后再无用处：显式释放并把显存交还驱动。
+    # 不 empty_cache 的话内存只回到 PyTorch 缓存池，而上面选 q_device 用的
+    # torch.cuda.mem_get_info 问的是**驱动**的空闲量 → 下一条曲线看到的 free 仍是
+    # 扣掉 Q(50GB) 后的值，于是误判显存不足、Q 回退 CPU（实测慢 2.5×）。
+    del Q, w, v_local, Qv
+    if q_device.type == "cuda":
+        torch.cuda.empty_cache()
+
     return eigvals, weights, alpha, beta
 
 
