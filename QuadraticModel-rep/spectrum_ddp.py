@@ -40,6 +40,7 @@ from model import Transformer, TransformerConfig
 from hvp import hessian_vector_product, gauss_newton_vector_product
 from gauss_radau import compute_spectrum_with_error_bands
 from data_grain import make_hvp_batches
+from opt import muon_Phalf, muon_reshape
 
 # 100BT parquet：HVP 用与训练/原版谱脚本相同的 grain 采样。
 DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_100B_parquet/sample/100BT"
@@ -88,13 +89,44 @@ def shard_bounds(n_params, world):
 
 
 # --------------------------------------------------------------------------
-# checkpoint 加载（与 run_spectrum_b64.py 对齐：EMA 参数 + EMA'd ν 预条件器）
+# checkpoint 加载：按 optim_name 自动切换预条件器口径
+#   adam  → 对角 √(pre·post/(√ν̂+eps))（EMA'd ν）
+#   muon  → dense-op √(pre·post)·C₅^{1/2}（EMA'd 动量 buffer，逐层 muon_Phalf）
+#   raw   → 对角 √(pre·post)（两种优化器共用，CompleteP-only 基线）
 # --------------------------------------------------------------------------
+def build_muon_precond(ck, model, ema_key, device):
+    """从 muon checkpoint 的动量 buffer（EMA'd 优先）重建 dense-op 预条件器。
+    返回 {name: {"Phalf":(L,d,d), "side":..}}，√(pre·post) 已并入 Phalf。"""
+    opt = ck["opt"]
+    ns_steps = opt.get("ns_steps", 5)
+    buf_ema = ck.get("buf_ema")
+    if buf_ema is not None and str(ema_key) in buf_ema:
+        buf_src = buf_ema[str(ema_key)]
+        used = f"EMA'd buffer ema={ema_key}"
+    else:
+        buf_src = opt["buf"]
+        used = "last buffer"
+    lr_groups = {name: (pre, post) for name, _, pre, post in model.lr_groups()}
+    precond = {}
+    for name, _ in model.named_parameters():
+        pre, post = lr_groups[name]
+        G = buf_src[name].to(device).float()
+        G2d = muon_reshape(name, G)                       # (L,m,n)
+        L = G2d.shape[0]
+        Phalfs, side = [], None
+        for l in range(L):
+            Ph, side = muon_Phalf(G2d[l], pre, post, ns_steps)
+            Phalfs.append(Ph)
+        precond[name] = {"Phalf": torch.stack(Phalfs, 0), "side": side}
+    return precond, used
+
+
 def load_checkpoint(path, ema_key, device):
     ck = torch.load(path, map_location="cpu")
     c = ck["config"]
     cfg = TransformerConfig(D=c["D"], L=c["L"], M=c["M"], H=c["H"], K=c["K"],
                             V=c["V"], seq_len=c["seq_len"])
+    optim_name = c.get("optim_name", "adam")   # 旧 ckpt 无此字段 → 回退 adam
     model = Transformer(cfg)
 
     ema = ck.get("ema")
@@ -109,31 +141,38 @@ def load_checkpoint(path, ema_key, device):
         used = "last-iterate params"
     model.eval().to(device)
 
-    # Adam 预条件器：P = √(pre·post/(√ν̂ + eps))，ν̂ = EMA'd ν / (1 - Πβ2)
-    # ⚠ pre/post 从 model.lr_groups() 重建（opt_state 里的 pre/post 有旧序列化 bug）
     opt = ck["opt"]
-    log_prod_b2 = ck.get("log_prod_b2", opt.get("log_prod_b2", 0.0))
-    denom_b2 = max(-math.expm1(log_prod_b2), 1e-16)
-    nu_ema = ck.get("nu_ema")
-    if nu_ema is not None and str(ema_key) in nu_ema:
-        nu_src = nu_ema[str(ema_key)]
-        used_nu = f"EMA'd ν ema={ema_key}"
-    else:
-        nu_src = opt["nu"]
-        used_nu = "last ν"
-    eps = opt["eps"]
     lr_groups = {name: (pre, post) for name, _, pre, post in model.lr_groups()}
-    precond = {}       # Adam：√(pre·post/(√ν̂+eps))
-    precond_raw = {}   # raw：CompleteP 每层 lr 形状乘子 √(pre·post)（无 Adam 的 ν）
+
+    # raw 预条件器（两优化器共用）：CompleteP 每层 lr 形状乘子 √(pre·post)（无 ν/无 C₅）。
+    # 已验证：λmax≈1.2，与论文 raw(~0.34) 同量级(~4×)；纯裸 H 会被数据钉死(~22, 64×)。
+    precond_raw = {}
     for name, _ in model.named_parameters():
         pre, post = lr_groups[name]
-        nu_hat = nu_src[name].to(device).float() / denom_b2
-        precond[name] = torch.sqrt(pre * post / (torch.sqrt(nu_hat) + eps))
-        # 论文的 "raw" 谱 = CompleteP-only 预条件（每层 lr 形状乘子，无 Adam 的 ν）。
-        # 已验证：这样 λmax≈1.2，与论文 raw(~0.34) 同量级(~4×)；纯裸 H 会被数据钉死(~22, 64×)。
         precond_raw[name] = torch.sqrt(torch.tensor(pre * post, device=device, dtype=torch.float32))
-    log(f"  {used}; {used_nu}")
-    return model, cfg, precond, precond_raw
+
+    if optim_name == "muon":
+        precond, used_opt = build_muon_precond(ck, model, ema_key, device)
+        log(f"  optim=muon; {used}; {used_opt}")
+    else:
+        # Adam 对角：P = √(pre·post/(√ν̂ + eps))，ν̂ = EMA'd ν / (1 - Πβ2)
+        log_prod_b2 = ck.get("log_prod_b2", opt.get("log_prod_b2", 0.0))
+        denom_b2 = max(-math.expm1(log_prod_b2), 1e-16)
+        nu_ema = ck.get("nu_ema")
+        if nu_ema is not None and str(ema_key) in nu_ema:
+            nu_src = nu_ema[str(ema_key)]
+            used_nu = f"EMA'd ν ema={ema_key}"
+        else:
+            nu_src = opt["nu"]
+            used_nu = "last ν"
+        eps = opt["eps"]
+        precond = {}
+        for name, _ in model.named_parameters():
+            pre, post = lr_groups[name]
+            nu_hat = nu_src[name].to(device).float() / denom_b2
+            precond[name] = torch.sqrt(pre * post / (torch.sqrt(nu_hat) + eps))
+        log(f"  optim=adam; {used}; {used_nu}")
+    return model, cfg, optim_name, precond, precond_raw
 
 
 # --------------------------------------------------------------------------
@@ -334,22 +373,22 @@ def main():
     log(f"world={world} backend={args.backend} device={device}")
     log(f"m={args.m}  n_tokens={args.n_tokens}  ema={args.ema}  ckpt={args.ckpt}")
 
-    model, cfg, precond, precond_raw = load_checkpoint(args.ckpt, args.ema, device)
+    model, cfg, optim_name, precond, precond_raw = load_checkpoint(args.ckpt, args.ema, device)
     n_params = model.n_params()
     bounds = shard_bounds(n_params, world)
     s0, s1 = bounds[rank]
-    log(f"  n_params={n_params:,}  每 rank shard≈{(s1-s0):,}  "
+    log(f"  optim={optim_name}  n_params={n_params:,}  每 rank shard≈{(s1-s0):,}  "
         f"Q_local(m={args.m},fp32)={args.m*(s1-s0)*4/1e9:.1f}GB/rank")
 
     local_batches, nb_global = make_local_batches(cfg, args.n_tokens, world, rank, device, args.seed, per=args.per)
     tokens_actual = nb_global * args.per * cfg.seq_len
     log(f"  HVP: nb_global={nb_global} minibatch × {args.per} × {cfg.seq_len} = {tokens_actual:,} tokens")
 
-    # 每条曲线的预条件选择器："adam"=Adam P √(pre·post/(√ν̂+eps))；"raw"=CompleteP √(pre·post)（无 ν）。
-    # 论文的 "raw" 曲线就是 CompleteP-only（已验证 λmax 与论文同量级）。
-    # tag 用 gn_raw/hessian_raw（我们自己的命名，非真 SGD）。论文缓存那边写死叫 gn_sgd，
-    # 只在画图脚本 plot_compare_running.py 里把 raw 映射到论文的 B64_P100_*_sgd key。
-    CURVES = [("gn", "adam", "gn_adam"), ("hessian", "adam", "hessian_adam"),
+    # 每条曲线的预条件选择器：
+    #   "opt" = 该 ckpt 优化器的预条件器（adam 对角 / muon dense-op），tag 带 optim_name。
+    #   "raw" = CompleteP √(pre·post)（无 ν/无 C₅）；tag 用 gn_raw/hessian_raw。
+    opt_tag = optim_name   # "adam" | "muon"
+    CURVES = [("gn", "opt", f"gn_{opt_tag}"), ("hessian", "opt", f"hessian_{opt_tag}"),
               ("gn", "raw", "gn_raw"), ("hessian", "raw", "hessian_raw")]
     if args.curves != "all":
         want = {c.strip() for c in args.curves.split(",") if c.strip()}
@@ -360,12 +399,12 @@ def main():
         log(f"  只跑曲线: {[t for *_,t in CURVES]}")
 
     def resolve_precond(sel):
-        return precond if sel == "adam" else precond_raw
+        return precond if sel == "opt" else precond_raw
 
-    log("  raw 曲线预条件: CompleteP √(pre·post)（含每层 lr 乘子、无 Adam ν）")
+    log(f"  opt 曲线预条件: {optim_name}；raw 曲线预条件: CompleteP √(pre·post)")
 
     out = {"m": args.m, "n_params": n_params, "n_tokens": tokens_actual, "ema": args.ema,
-           "raw_precond": "completep"}
+           "optim_name": optim_name, "raw_precond": "completep"}
     if is_master():
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 

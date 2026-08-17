@@ -204,7 +204,9 @@ class NeuronHessian:
 
         loss_type: "ce" -> exact softmax cross-entropy curvature
         p_k(1-p_k) x x^T (class-dependent). "mse" -> MSE-vs-one-hot curvature
-        (2/C_full) x x^T, identical for every class (C_full = full vocab)."""
+        (2/C_full) x x^T, identical for every class (C_full = full vocab).
+        "mse_rep" -> replication 0.5*per-position-sum convention, curvature
+        1 * x x^T (same class-independent structure, scaled by C_full/2)."""
         head = self._module(head_path)
         d = head.in_features
         C_full = head.out_features
@@ -216,9 +218,11 @@ class NeuronHessian:
                 C = min(C, max_classes)
             ks = list(range(C))
 
-        # MSE: every class shares one block H = (2/C_full) * mean_t x x^T, so we
-        # accumulate the feature Gram once and skip the per-class softmax loop.
-        if loss_type == "mse":
+        # MSE-family: every class shares one block H = c * mean_t x x^T with
+        # c = 2/C_full ("mse") or 1 ("mse_rep"), so we accumulate the feature
+        # Gram once and skip the per-class softmax loop.
+        if loss_type in ("mse", "mse_rep"):
+            c = 1.0 if loss_type == "mse_rep" else 2.0 / C_full
             Gram = torch.zeros((d, d), dtype=torch.float64, device=self.device)
             n_tok = 0
             captured = {}
@@ -234,7 +238,7 @@ class NeuronHessian:
                     Gram += feat.t() @ feat
                     n_tok += feat.shape[0]
             h.remove()
-            block = (2.0 / C_full) * (Gram / max(1, n_tok))
+            block = c * (Gram / max(1, n_tok))
             block_eigs = torch.linalg.eigvalsh(block).cpu().numpy()           # (d,)
             # identical spectrum for every selected class
             return np.tile(block_eigs, (len(ks), 1)).copy()
@@ -335,7 +339,8 @@ class NeuronHessian:
 
           MSE-vs-one-hot:  d^2L/dz^2 = (2/C) I  (constant, position-independent),
             so H_v = (N_v/N) * (2/C) * W^T W  -- rank d, one shared matrix scaled
-            by the token frequency N_v/N.
+            by the token frequency N_v/N.  "mse_rep" (0.5*per-position-sum) has
+            d^2L/dz^2 = I, so H_v = (N_v/N) * W^T W (same structure, x C/2).
           CE:  S_t = diag(p_t) - p_t p_t^T with p_t = softmax(z_t); p_t depends on
             the position (via the added positional encoding), so we accumulate
             W^T S_t W over the positions where token v appears.
@@ -362,9 +367,11 @@ class NeuronHessian:
         cnt = torch.zeros(n_sel, dtype=torch.float64, device=self.device)
         n_tok = 0
 
-        # MSE: curvature is constant (2/C) I, so H_v = (N_v/N)(2/C) W^T W. We only
-        # need per-token counts -- no logits, one shared matrix.
-        if loss_type == "mse":
+        # MSE-family: curvature is constant c*I (c = 2/C for "mse", 1 for
+        # "mse_rep"), so H_v = (N_v/N) * c * W^T W. We only need per-token
+        # counts -- no logits, one shared matrix.
+        if loss_type in ("mse", "mse_rep"):
+            c = 1.0 if loss_type == "mse_rep" else 2.0 / C_full
             WtW = (W.t() @ W).to(self.device)                          # (d,d)
             store = {}
             def fhook(mod, inp, out):
@@ -380,7 +387,7 @@ class NeuronHessian:
                     slot = lut[ids]; slot = slot[slot >= 0]
                     cnt.index_add_(0, slot, torch.ones_like(slot, dtype=torch.float64))
             h.remove()
-            base = (2.0 / C_full) * WtW                                # shared (d,d)
+            base = c * WtW                                             # shared (d,d)
             wbase = torch.linalg.eigvalsh(base).cpu().numpy()          # (d,)
             scale = (cnt / max(1, n_tok)).cpu().numpy()                # (n_sel,) = N_v/N
             eigs = scale[:, None] * wbase[None, :]                     # (n_sel,d)

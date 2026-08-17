@@ -153,7 +153,7 @@ files/
 install_claude.sh
 .vscode/
 .claude_persist/
-.claude/settings.local.json
+.claude/
 
 # runs
 /toy_models/runs
@@ -169,6 +169,14 @@ sco-backup/
 
 # replication
 /replication
+/QuadraticModel
+/QuadraticModel-rep/checkpoints_b64
+/QuadraticModel-rep/checkpoints_b64_lossy
+/QuadraticModel-rep/diag
+/QuadraticModel-rep/figures
+/QuadraticModel-rep/outputs
+/QuadraticModel-rep/test_outputs
+/QuadraticModel-rep/fineweb
 
 #reduce the load of vscode
 pyrightconfig.json
