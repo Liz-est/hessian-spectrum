@@ -11,7 +11,10 @@ B=64 训练脚本（8×H100 DDP），复现 QuadraticModel olmo150m 论文设置
 checkpoint 在 10%/50%/100% 保存：模型参数 + 优化器 (nu/mu/log_prod_b2/pre/post/base_lr)
  + EMA，供后续 Lanczos 谱与 Adam 预条件器精确重建。
 
-数据：data/fineweb_edu_bpe8192/{train,val}.bin（uint16，bpe_8192 重分词的 FineWeb-Edu）。
+数据：grain 采样（复现 QuadraticModel/data.py 管线，源换 parquet）。读 100BT parquet
+（train=files[:-1] / eval=files[-1:]），滑窗 shuffle → 逐文档分词追加 <eot>
+→ ConcatThenSplit 切 (seq_len+1) 窗 → 顺序 batch。见 data_grain.build_loaders。
+⚠ parquet 源用滑窗 shuffle（非原版全局索引 shuffle），文档顺序不同、非 bit 级复现。
 
 启动：
   torchrun --standalone --nproc_per_node=8 train.py
@@ -27,13 +30,18 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 sys.path.insert(0, os.path.dirname(__file__))
 from model import Transformer, TransformerConfig
 from opt import CompletePAdam, EMA
+from data_grain import build_loaders
 
 # ---------------- 配置 ----------------
-DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_bpe8192_clean"
+# 数据走 grain 采样（parquet 源：滑窗 shuffle → concat-split → 顺序 batch），
+# 读 100BT parquet（train=files[:-1] / eval=files[-1:]）。
+# ⚠ parquet 源非原版 arrayrecord 全局 shuffle，文档顺序不同、非 bit 级复现。
+DATA_DIR = "/data/250010020/hessian-spectrum/data/fineweb_edu_100B_parquet/sample/100BT"
 OUT_DIR = "/data/250010020/hessian-spectrum/QuadraticModel-rep/checkpoints_b64"
 TOTAL_TOKENS = 3_000_000_000
 BATCH = 64                 # 全局 batch（跨所有 GPU）
 SEQ = 1024
+VOCAB = 8192
 OPT_LR = 16.0              # eta = sqrt(64)*2.0
 B1, B2_PCT, EPS = 0.9, 0.01, 1e-8
 WARMUP_PCT, INIT_V, PEAK_V, END_V = 0.1, 0.1, 1.0, 0.1
@@ -50,22 +58,6 @@ def is_master():
 def log(*a):
     if is_master():
         print(*a, flush=True)
-
-
-class TokenLoader:
-    """从连续 uint16 token 流按随机偏移采样 (B, SEQ+1) 窗口。"""
-    def __init__(self, path, seq, device, seed):
-        self.data = np.memmap(path, dtype=np.uint16, mode="r")
-        self.seq = seq
-        self.device = device
-        self.g = torch.Generator().manual_seed(seed)
-        self.n = len(self.data)
-
-    def batch(self, bs):
-        ix = torch.randint(self.n - self.seq - 1, (bs,), generator=self.g)
-        x = torch.stack([torch.from_numpy(self.data[i:i+self.seq].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(self.data[i+1:i+1+self.seq].astype(np.int64)) for i in ix])
-        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 
 def main():
@@ -107,8 +99,14 @@ def main():
     nu_named = [(name, opt.nu[i]) for i, (name, _, _, _) in enumerate(lr_groups)]
     nu_ema = EMA(nu_named, pct=EMA_PCT) if is_master() else None
 
-    train = TokenLoader(os.path.join(DATA_DIR, "train.bin"), SEQ, device, SEED + rank)
-    val = TokenLoader(os.path.join(DATA_DIR, "val.bin"), SEQ, device, 12345 + rank)
+    # 数据：原版 grain 采样（seed=0 全局 shuffle + concat-split + 顺序 batch）。
+    # 每个 rank 迭代同一条全局流（同 seed → 逐 batch 一致），再切自己那 local_bs 行。
+    train_iter, eval_factory, _ds = build_loaders(
+        data_dir=DATA_DIR,
+        seq_len=SEQ, vocab_size=VOCAB,
+        global_batch=BATCH, eval_batch=BATCH,
+        device=device, rank=rank, world=world, seed=SEED,
+    )
 
     if is_master():
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -133,22 +131,31 @@ def main():
     @torch.no_grad()
     def eval_loss():
         """返回 (val_loss, mean_entropy)。entropy 是 lm_head 曲率的核心止损指标：
-        softmax 越尖锐(entropy 越低)→ lm_head GN 块 λ_max 越大(见口径对拍结论)。"""
+        softmax 越尖锐(entropy 越低)→ lm_head GN 块 λ_max 越大(见口径对拍结论)。
+        eval_factory() 每次返回从头开始的有限 eval 流（shuffle=False），最多取
+        EVAL_BATCHES 个 batch；不足则用实际取到的数量归一。"""
         raw.eval()
         tot = torch.zeros((), device=device)
         ent = torch.zeros((), device=device)
+        eval_it = eval_factory()
+        n = 0
         for _ in range(EVAL_BATCHES):
-            x, y = val.batch(local_bs)
+            try:
+                x, y = next(eval_it)
+            except StopIteration:
+                break
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits, l = raw(x, y)
             tot += l.detach()
             p = F.softmax(logits.float(), dim=-1)
             ent += -(p * p.clamp_min(1e-12).log()).sum(-1).mean().detach()
+            n += 1
         raw.train()
+        n = max(n, 1)
         if ddp:
             dist.all_reduce(tot, op=dist.ReduceOp.SUM); tot /= world
             dist.all_reduce(ent, op=dist.ReduceOp.SUM); ent /= world
-        return (tot / EVAL_BATCHES).item(), (ent / EVAL_BATCHES).item()
+        return (tot / n).item(), (ent / n).item()
 
     log("开始训练...")
     raw.train()
@@ -162,18 +169,18 @@ def main():
         save_ckpt(0, 0.0)
     for step in range(steps + 1):
         if step in eval_steps or step in ckpt_steps:
-            val, ent = eval_loss()
+            vloss, ent = eval_loss()
             hs = head_std()
-            log(f"step {step:6d}/{steps} ({step/steps:.1%})  val_loss={val:.4f}  "
+            log(f"step {step:6d}/{steps} ({step/steps:.1%})  val_loss={vloss:.4f}  "
                 f"entropy={ent:.3f}  head_std={hs:.4f}  elapsed={time.time()-t0:.0f}s")
             if is_master():
-                loss_log.append((step, step/steps, val, ent, hs))
+                loss_log.append((step, step/steps, vloss, ent, hs))
         if step in ckpt_steps:
             save_ckpt(step, ckpt_steps[step])
         if step == steps:
             break
 
-        x, y = train.batch(local_bs)
+        x, y = next(train_iter)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             _, loss = model(x, y)
         opt.zero_grad(set_to_none=True)
