@@ -104,9 +104,13 @@ def eval_ckpt_by_group(model, cfg, val_x, val_y, gid_t, device, n_groups):
             logits, _ = model(x, y)
             tgt = y.view(-1)
             flat = logits.view(-1, logits.size(-1))
-            if loss_type == "mse":
+            if loss_type in ("mse", "mse_rep"):
                 onehot = F.one_hot(tgt, num_classes=flat.size(-1)).to(flat.dtype)
-                per_pos = (flat - onehot).pow(2).mean(dim=-1)  # mean over classes
+                sq = (flat - onehot).pow(2)
+                if loss_type == "mse_rep":
+                    per_pos = 0.5 * sq.sum(dim=-1)     # replication: 0.5*sum
+                else:
+                    per_pos = sq.mean(dim=-1)          # mean over classes
             else:
                 per_pos = F.cross_entropy(flat, tgt, reduction="none")
             g = gid_t[tgt]
@@ -131,8 +135,9 @@ def plot_run(run, rows, masses, out_png, loss_type="ce"):
     ax.annotate(f" G{N_GROUPS-1} least freq", (iters[-1], rows[-1][2][-1]),
                 fontsize=8, color=RAMP[2], va="center")
     ax.set_xlabel("iteration")
-    if loss_type == "mse":
-        ax.set_ylabel("val loss (MSE vs one-hot)")
+    if loss_type in ("mse", "mse_rep"):
+        ax.set_ylabel("val loss (0.5*sum sq. err, rep)" if loss_type == "mse_rep"
+                      else "val loss (MSE vs one-hot)")
         ax.set_yscale("log")   # zipf groups span decades in MSE; log keeps all visible
     else:
         ax.set_ylabel("val loss (cross-entropy)")

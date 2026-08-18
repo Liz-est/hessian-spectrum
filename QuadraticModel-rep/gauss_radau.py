@@ -1,128 +1,139 @@
 """
 Gauss-Radau Quadrature 用于 Lanczos 谱的误差带估计
 
-理论基础（Golub & Meurant, "Matrices, Moments and Quadrature and their
-applications"，Chapter 6）：
-- Lanczos 三对角矩阵 T_m 的特征值分解给出 m 点 Gauss quadrature 规则，
-  其节点=Ritz 值 θ_i，权重=U[0,i]^2。它给出谱测度 μ 的一个离散近似。
-- 目标量：累积谱分布 Φ(t) = μ({λ ≤ t})（"有多少比例的特征值 ≤ t"）。
-  绘图横轴 eigenvalue index = N_params × (1 - Φ(t))
-  （index 越大特征值越小，所以用"≥ t 的质量"= 1 - Φ(t)）。
-- 误差带：把 Gauss-Radau 规则的固定节点分别锚定在谱区间的左端点 a=λmin
-  和右端点 b=λmax，得到 Φ 的一对上下界（Golub-Meurant Thm 6.4）：
-      Radau(a) 与 Radau(b) 夹住真实 Φ(t)。
-  Gauss 规则本身给中点估计 mid。三者取 min/max 保证 lo ≤ mid ≤ hi。
+对齐论文原版 QuadraticModel/analysis/spectrum/{postprocess.py,quadrature.py}
+的 hessian/gn 分支（scipy-only 移植）。理论基础（Golub & Meurant, "Matrices,
+Moments and Quadrature and their applications"，Chapter 6）：
+- Lanczos 三对角矩阵 T_m 的特征分解给出 m 点 Gauss 规则，节点=Ritz 值 θ_i、
+  权重=U[0,i]^2，近似谱测度 μ。累积分布 Φ(t)=μ({λ≤t})，绘图横轴
+  eigenvalue index = N_params × (1 − Φ(t))。
+- 误差带：把 Gauss-Radau 规则的固定节点逐格点锚定在 t 上（quadrature.py 的
+  radau_batch），得到 index 的一对上下界；中线由 band_midpoint 求。
+- hessian 分支 cut=m、跨零 signed-log 网格覆盖 [λmin,λmax]、R>0；gn（半正定）
+  分支 cut=#positive、R=0、网格只在正谱。详见 compute_spectrum_with_error_bands。
 """
 import numpy as np
 from scipy.linalg import eigh_tridiagonal
-from typing import Tuple
 
 
-def _radau_matrix(alpha: np.ndarray, beta: np.ndarray, anchor: float):
-    """
-    构造 (m)×(m) Gauss-Radau 三对角矩阵：修改最后一个对角元素 α_m，
-    使 `anchor` 成为该 quadrature 规则的一个精确节点（Golub 1973）。
-
-    修正量：α_m^new = anchor + δ，其中
-        δ = β_{m-1}^2 · e_m^T (T_{m-1} - anchor·I)^{-1} e_m
-    这里 T_{m-1} 是去掉最后一行/列的 (m-1) 阶主子阵，δ 通过解三对角系统
-        (T_{m-1} - anchor·I) x = e_{m-1}
-    的最后一个分量得到。
-
-    Args:
-        alpha: (m,) 对角元素
-        beta:  (m-1,) 次对角元素
-        anchor: 要锚定的节点（通常是谱端点 λmin 或 λmax）
-
-    Returns:
-        alpha_radau: (m,) 修改后的对角元素（仅最后一个不同）
-        beta: (m-1,) 次对角元素（不变）
-    """
-    m = len(alpha)
-    if m == 1:
-        return np.array([anchor], dtype=np.float64), beta
-
-    # 解 (T_{m-1} - anchor I) x = e_{m-1}，取 x 的最后一个分量
-    # T_{m-1}: 对角 alpha[0..m-2]，次对角 beta[0..m-3]
-    d = alpha[:m - 1] - anchor          # 对角 (m-1,)
-    e = beta[:m - 2]                    # 次对角 (m-2,)
-
-    # Thomas 算法（前向消元 + 回代），右端项 = e_{m-1}（最后一个为 1）
-    n = m - 1
-    c = np.zeros(n)   # 归一化后的上对角
-    rhs = np.zeros(n)
-    rhs[-1] = 1.0
-
-    c[0] = e[0] / d[0] if n > 1 else 0.0
-    rhs[0] = rhs[0] / d[0]
-    for i in range(1, n):
-        denom = d[i] - e[i - 1] * c[i - 1]
-        if i < n - 1:
-            c[i] = e[i] / denom
-        rhs[i] = (rhs[i] - e[i - 1] * rhs[i - 1]) / denom
-
-    x_last = rhs[-1]
-    for i in range(n - 2, -1, -1):
-        rhs[i] = rhs[i] - c[i] * rhs[i + 1]
-    # 回代后 rhs 存的是解 x；我们只要最后分量
-    delta = rhs[-1]  # = e_{m-1}^T (T_{m-1}-anchor I)^{-1} e_{m-1}
-
-    alpha_radau = alpha.copy()
-    alpha_radau[-1] = anchor + beta[-1] ** 2 * delta
-    return alpha_radau, beta
+# ============================================================================
+# 论文原版 postprocess（analysis/spectrum/postprocess.py + quadrature.py）
+# 的 hessian 分支 scipy-only 移植。旧的启发式误差带（node-gap gradient、
+# cut=#positive、R=0）会把整条尾巴截断在「最小正 Ritz 节点」——而 167M 参数
+# 的 Hessian 只有几百个非平凡特征值，其余零空间被 Lanczos 塌缩成一个位于机器零
+# 附近的 Ritz 值，它的符号(±1e-7)由舍入误差决定。旧逻辑用 cut=#positive，让整条
+# 尾巴长度取决于这个无意义的符号（1M 落在 +3.99e-7 → 尾到 1.63e8；5M 落在
+# -6.89e-7 → 被丢弃、尾只到 1.30e7）。原版用 cut=m + 跨零 signed-log 网格 +
+# 逐格点 Gauss-Radau 锚定(R>0)，两条曲线自洽且都延伸到 N。
+# ============================================================================
 
 
-def _cdf_from_rule(nodes: np.ndarray, weights: np.ndarray, grid: np.ndarray) -> np.ndarray:
-    """
-    从一个 quadrature 规则（节点/权重）计算累积分布 Φ(t)=Σ_{θ_i ≤ t} ω_i，
-    在 grid 上求值（右连续阶梯函数）。
-    """
-    order = np.argsort(nodes)
-    nd = nodes[order]
-    wd = weights[order]
-    cw = np.cumsum(wd)
-    # 对每个 t，找到 ≤ t 的最大节点位置
-    idx = np.searchsorted(nd, grid, side='right') - 1
-    cdf = np.where(idx >= 0, cw[np.clip(idx, 0, len(cw) - 1)], 0.0)
-    return cdf
+def _signed_log(x, t):
+    return np.sign(x) * np.log1p(np.abs(x) / t)
 
 
-def cumulative_spectral_density(
-    alpha: np.ndarray,
-    beta: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    从 Lanczos 三对角矩阵计算 Gauss quadrature 节点(Ritz 值)与权重。
-
-    Returns:
-        nodes: (m,) Ritz 值，升序
-        weights: (m,) 对应权重（U[0,i]^2），Σ=1
-    """
-    eigenvalues, U = eigh_tridiagonal(alpha, beta)
-    weights = U[0, :] ** 2
-    order = np.argsort(eigenvalues)
-    return eigenvalues[order], weights[order]
+def _signed_exp(x, t):
+    return np.sign(x) * t * np.expm1(np.abs(x))
 
 
-def ritz_convergence(alpha: np.ndarray, beta: np.ndarray):
-    """
-    每个 Ritz 值的 Lanczos 残差收敛估计 rel_i = β_m·|U[-1,i]| / |θ_i|。
+def _evaluation_grid(low, high, size, threshold):
+    """跨零 signed-log 网格（原版 postprocess.evaluation_grid）。"""
+    eps = 3e-8
+    if low > 0 and high > 0:
+        return np.geomspace(low * (1 + eps), high * (1 - eps), size)
+    if low < 0 and high < 0:
+        return -np.geomspace(abs(low) * (1 - eps), abs(high) * (1 + eps), size)
+    tl, th = _signed_log(np.asarray([low, high]), threshold)
+    margin = eps * (th - tl)
+    return _signed_exp(np.linspace(tl + margin, th - margin, size), threshold)
 
-    这是标准的「Ritz 值是否已收敛为真实特征值」判据（Paige/Saad）：
-    U[-1,i] 是第 i 个 Ritz 向量在 Lanczos 基下的末分量，β_m=beta[-1]。
-    rel_i < tol 的 Ritz 值视为已锁定的离散特征值，其余归入连续体。
 
-    Returns:
-        nodes: (m,) Ritz 值，降序（大特征值在前）
-        weights: (m,) 对应权重，同序
-        rel: (m,) 相对残差，同序
-    """
-    ev, U = eigh_tridiagonal(alpha, beta)
-    w = U[0, :] ** 2
-    resid = abs(beta[-1]) * np.abs(U[-1, :])
-    rel = resid / np.maximum(np.abs(ev), 1e-30)
-    order = np.argsort(ev)[::-1]           # 降序：大特征值在前
-    return ev[order], w[order], rel[order]
+def _nudge_from_ritz(value, ritz, rd=3e-8):
+    """把落在 Ritz 值上的格点微推离开，避免 Radau 固定节点退化。"""
+    i = np.argmin(np.abs(ritz - value))
+    e = rd * max(abs(ritz[i]), abs(value), np.finfo(float).tiny)
+    if abs(value - ritz[i]) < e:
+        side = np.sign(value - ritz[i]) or -1.0
+        value = ritz[i] + side * e
+    return value
+
+
+def _weights_from_eigenvalues(theta, diagonal, off_diagonal):
+    """三项递推稳定地算 Radau 规则权重（原版 quadrature 同名函数）。"""
+    xp = np.ones_like(theta)
+    x = (theta - diagonal[0]) / off_diagonal[0]
+    total = xp * xp + x * x
+    nrm = np.maximum(1.0, np.maximum(np.abs(xp), np.abs(x)))
+    xp /= nrm
+    x /= nrm
+    total /= nrm * nrm
+    log_scale = np.log(nrm)
+    for i in range(1, len(diagonal) - 1):
+        xn = ((theta - diagonal[i]) * x - off_diagonal[i - 1] * xp) / off_diagonal[i]
+        nrm = np.maximum(1.0, np.maximum(np.abs(x), np.abs(xn)))
+        total = (total + xn * xn) / (nrm * nrm)
+        xp = x / nrm
+        x = xn / nrm
+        log_scale += np.log(nrm)
+    return np.exp(-np.log(total) - 2 * log_scale)
+
+
+def _radau_batch_scipy(a, b, lams, left_locked, right_locked, scale):
+    """逐格点把 Gauss-Radau 固定节点锚在 lam 上，返回 (above, above+forced) 的
+    index 上下界对（原版 quadrature.radau_batch_scipy）。b 长度为 m（末位=残差 β_m）。"""
+    off = b[: len(a) - 1]
+    beta = b[len(a) - 1]
+    d = a[0] - lams
+    for i in range(1, len(a)):
+        d = a[i] - lams - off[i - 1] ** 2 / d
+    eoff = np.r_[off, beta]
+    result = []
+    for lam, last_alpha in zip(lams, lams + beta ** 2 / d):
+        diagonal = np.r_[a, last_alpha]
+        theta = eigh_tridiagonal(
+            diagonal, eoff, eigvals_only=True,
+            check_finite=False, lapack_driver="sterf",
+        )
+        w = scale * _weights_from_eigenvalues(theta, diagonal, eoff)
+        if left_locked or right_locked:
+            locked = np.zeros_like(theta, dtype=bool)
+            if right_locked:
+                locked[:right_locked] = True
+            if left_locked:
+                locked[-left_locked:] = True
+            w[locked] = 1.0
+            w[~locked] *= (scale - left_locked - right_locked) / w[~locked].sum()
+        fi = np.argmin(np.abs(theta - lam))
+        nf = np.ones_like(theta, dtype=bool)
+        nf[fi] = False
+        above = w[nf & (theta > lam)].sum()
+        result.append((above, above + w[fi]))
+    return np.asarray(result)
+
+
+def _distance_to_polyline_squared(x, y, px, py):
+    x0, y0 = px[:-1][None], py[:-1][None]
+    dx = (px[1:] - px[:-1])[None]
+    dy = (py[1:] - py[:-1])[None]
+    x, y = x[:, None], y[:, None]
+    weight = np.clip(((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy), 0, 1)
+    return np.min((x - x0 - weight * dx) ** 2 + (y - y0 - weight * dy) ** 2, axis=1)
+
+
+def _band_midpoint(values, lower, upper, threshold):
+    """原版 band_midpoint：在 log-index / signed-log-eig 空间用二分求 lo/hi 中线。"""
+    lower_log = np.log(lower)
+    upper_log = np.log(upper)
+    values_log = _signed_log(values, threshold)
+    left, right = lower_log.copy(), upper_log.copy()
+    for _ in range(48):
+        center = 0.5 * (left + right)
+        closer = _distance_to_polyline_squared(
+            center, values_log, lower_log, values_log
+        ) < _distance_to_polyline_squared(center, values_log, upper_log, values_log)
+        left = np.where(closer, center, left)
+        right = np.where(closer, right, center)
+    return np.exp(0.5 * (left + right))
 
 
 def compute_spectrum_with_error_bands(
@@ -130,97 +141,128 @@ def compute_spectrum_with_error_bands(
     beta: np.ndarray,
     n_params: int,
     n_grid: int = 400,
-    conv_tol: float = 1e-10,
+    curvature: str = "hessian",
+    rel_tol: float = 1e-6,
+    linthresh: float = 1e-8,
+    radau_chunk: int = 32,
+    conv_tol: float | None = None,   # 兼容旧调用签名（已弃用，不再使用）
 ) -> dict:
     """
-    完整的谱计算：已收敛 Ritz 值 → 离散锁定点；未收敛 Ritz 值 → 连续体 + 误差带。
+    Lanczos α/β → 谱曲线，对齐论文原版 postprocess.spectrum_curve 的 hessian/gn 分支。
 
-    误差带方法（与论文缓存一致，已由反解核实）：
-      * 用残差判据 rel_i = β_m·|U[-1,i]|/|θ_i| < conv_tol 把 Ritz 值分成
-        「已锁定离散谱」(前 L 个，最大的那些) 与「连续体」(其余)。
-      * 连续体区某个特征值 g 的 index 不确定性 = 覆盖它的**相邻连续体 Ritz
-        节点的 index 间距**（节点越稀 → 带越宽），而非 Gauss-Radau 端点夹逼。
-        （在 m 很大、完整重正交时 Radau 夹逼会退化成零宽，与论文不符。）
+    - curvature="hessian"（默认，裸 Hessian / 预条件 Hessian）：cut=m，跨零 signed-log
+      网格覆盖 [λmin, λmax]，逐格点 Gauss-Radau 锚定给出 index 上下界(R>0)。
+    - curvature="gn"（半正定 Gauss-Newton）：R=0，cut=#positive，网格只在正谱。
 
-    返回字段与 spectrum_3x3.npz 一致（x/y/dot_x/g/lo/hi/mid/L/R/cut），
-    其中 mid/lo/hi 均为 eigenvalue index（= N_params × 质量），横轴用；
-    g 为对应的 eigenvalue（纵轴，正谱对数网格）。
+    收敛判据用残差 rel_i = β_m·|U[-1,i]|/|θ_i| < rel_tol（原版默认 1e-6）划出左端已锁定
+    离散谱 L 与右端已锁定 R；其余为连续体，rank 用 √(lower·upper) 质量分配。
 
     Args:
-        alpha: (m,) Lanczos 三对角对角元素
-        beta:  (m-1,) 次对角元素
-        n_params: 参数总数（index 的缩放）
-        n_grid: 正谱网格点数
-        conv_tol: Ritz 收敛判据相对残差阈值（默认 1e-10，复现论文 L）
+        alpha: (m,) 三对角对角元素
+        beta:  (m-1,) 次对角，或 (m,) 末位为残差 β_m。长度 m-1 时用 β_{m-1} 作残差代理
+               （已验证正谱尾对残差在 [0.5×,2×] 区间不敏感）。
+        n_params: 参数总数 N（index 缩放）
+        n_grid: 网格点数
+        curvature: "hessian" | "gn"
 
     Returns:
-        dict
+        dict(x, y, dot_x, g, lo, hi, mid, L, R, cut)：x/mid/lo/hi 是 eigenvalue index，
+        y/g 是 eigenvalue。plotter combined_positive 用 x[:L]/y[:L] 画锁定头、mid/g 画连续体。
     """
-    N = float(n_params)
-
-    # 1) Ritz 值（降序）+ 权重 + 残差收敛判据
-    nodes_desc, w_desc, rel_desc = ritz_convergence(alpha, beta)
-    lambda_max = float(nodes_desc[0])
-
-    # 累积 index：第 i 个 Ritz 值（降序）之前的质量 → index
-    cum = np.cumsum(w_desc)              # 累积质量（含自身）
-    ritz_index = N * cum                 # 大特征值 → 小 index
-
-    # L = 已收敛（锁定为离散特征值）的个数：从最大特征值起连续满足 rel<tol 的前缀
-    conv = rel_desc < conv_tol
-    L = int(np.argmax(~conv)) if (~conv).any() else len(conv)
-
-    # 2) 散点 x/y（论文约定：x 升序 index 1..N，y 降序 eigenvalue；
-    #    故 x[:L]/y[:L] 恰好是最大的 L 个已锁定特征值）
-    ritz_x = ritz_index.copy()          # 升序 index（index 越小 → 特征值越大）
-    ritz_y = nodes_desc.copy()          # 降序 eigenvalue
-    cut = int(np.sum(nodes_desc > 0))
-
-    # 3) 连续体节点（rank >= L）：它们的 (eigenvalue, index) 定义 mid 与误差带。
-    #    锁定段(rank<L)的高特征值由离散点 x[:L]/y[:L] 负责，连续体只覆盖 rank≥L，
-    #    故 grid 上限取最大连续体节点，避免高特征值端插值 clamp 出竖刺。
-    cont_y = nodes_desc[L:]              # eigenvalue，降序
-    cont_idx = ritz_index[L:]           # index，升序
-    pos = cont_y > 0
-    cy = cont_y[pos][::-1]              # eigenvalue 升序
-    ci = cont_idx[pos][::-1]           # 对应 index
-    order = np.argsort(cy)
-    cy, ci = cy[order], ci[order]
-    cont_max = float(cy.max()) if len(cy) else lambda_max
-    positive = nodes_desc[nodes_desc > 0]
-    positive_min = max(float(positive.min()), 1e-12) if len(positive) else 1e-12
-    grid = np.geomspace(positive_min, cont_max, n_grid)
-
-    # mid(g)：把 g 插值到连续体节点的 index（log-index vs log-eigenvalue 单调）
-    log_cy = np.log(np.maximum(cy, 1e-300))
-    log_ci = np.log(np.maximum(ci, 1e-300))
-    log_mid = np.interp(np.log(grid), log_cy, log_ci)
-    mid = np.exp(log_mid)
-
-    # 4) 误差带：连续体区某 eigenvalue 的 index 不确定性 = 覆盖它的相邻节点 index 间距。
-    #    带宽在 log-index 空间关于 mid 对称（与论文缓存一致），且需在 grid 上平滑：
-    #    对每个连续体节点算「到左右邻居的 log-index 半间距」，再平滑插值到 grid。
-    if len(log_ci) >= 2:
-        gap = np.gradient(log_ci)          # 每个节点的局部 log-index 间距（中心差分，平滑）
-        half = 0.5 * np.abs(gap)
-        half_grid = np.interp(np.log(grid), log_cy, half)
+    alpha = np.asarray(alpha, dtype=float)
+    beta = np.asarray(beta, dtype=float)
+    m = len(alpha)
+    # 统一成原版约定：betas 长度 m，末位是残差 β_m
+    if len(beta) == m - 1:
+        betas = np.r_[beta, beta[-1]]     # 残差未保存 → 用 β_{m-1} 作稳定代理
+    elif len(beta) == m:
+        betas = beta
     else:
-        half_grid = np.zeros_like(grid)
-    lo = np.exp(log_mid - half_grid)
-    hi = np.exp(log_mid + half_grid)
+        raise ValueError(f"beta length {len(beta)} incompatible with alpha length {m}")
+
+    N = float(n_params)
+    ev, U = eigh_tridiagonal(alpha, betas[:-1])
+    ev = ev[::-1]
+    U = U[:, ::-1]
+    weights = U[0] ** 2
+    residuals = betas[-1] * np.abs(U[-1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        locked = residuals / np.abs(ev) < rel_tol
+
+    left_locked = 0
+    while left_locked < len(ev) and locked[left_locked]:
+        left_locked += 1
+    right_locked = 0
+    while (right_locked < len(ev) - left_locked
+           and locked[len(ev) - 1 - right_locked]):
+        right_locked += 1
+
+    positive_semidefinite = curvature == "gn"
+    if positive_semidefinite:
+        right_locked = 0
+        cut = int((ev > 0).sum())
+    else:
+        cut = len(ev)
+
+    # rank 权重：锁定端 index=整数序号，连续体按 √(lower·upper) 质量分配
+    rank_weights = N * weights / weights.sum()
+    if left_locked:
+        rank_weights[:left_locked] = 1
+    if right_locked:
+        rank_weights[-right_locked:] = 1
+    if left_locked + right_locked < len(rank_weights):
+        stop = len(rank_weights) - right_locked
+        rank_weights[left_locked:stop] *= (
+            N - left_locked - right_locked
+        ) / rank_weights[left_locked:stop].sum()
+
+    ranks = np.empty_like(ev)
+    if left_locked:
+        ranks[:left_locked] = np.arange(1, left_locked + 1)
+    if right_locked:
+        ranks[-right_locked:] = N - right_locked + np.arange(1, right_locked + 1)
+    if left_locked + right_locked < len(ranks):
+        stop = len(ranks) - right_locked
+        edges = np.r_[0, np.cumsum(rank_weights[left_locked:stop])]
+        lower_rank = left_locked + 0.5 + edges[:-1]
+        upper_rank = left_locked + 0.5 + edges[1:]
+        ranks[left_locked:stop] = np.sqrt(
+            np.maximum(lower_rank, 1e-300) * np.maximum(upper_rank, 1e-300)
+        )
 
     result = {
-        "x": ritz_x,
-        "y": ritz_y,
-        "dot_x": ritz_x,
-        "g": grid,
-        "lo": lo,
-        "hi": hi,
-        "mid": mid,
-        "L": L,
-        "R": 0,
-        "cut": cut,
+        "x": ranks,
+        "y": ev,
+        "dot_x": ranks,
+        "L": int(left_locked),
+        "R": int(right_locked),
+        "cut": int(cut),
     }
+
+    if left_locked < cut:
+        low = 0.0 if positive_semidefinite else ev[cut - 1]
+        high = ev[left_locked - 1] if left_locked else ev[0]
+        if high > low:
+            grid = _evaluation_grid(low, high, n_grid, linthresh)
+            grid = np.asarray([_nudge_from_ritz(v, ev) for v in grid])
+            bounds = []
+            for start in range(0, len(grid), radau_chunk):
+                bounds.append(_radau_batch_scipy(
+                    alpha, betas, grid[start:start + radau_chunk],
+                    left_locked, right_locked, N,
+                ))
+            bounds = np.concatenate(bounds)
+            lower = np.maximum.accumulate(bounds[:, 0][::-1])[::-1]
+            upper = np.minimum.accumulate(bounds[:, 1])
+            lower = np.maximum(lower, 1e-12)
+            upper = np.maximum(upper, lower)
+            midpoint = _band_midpoint(grid, lower, upper, linthresh)
+            result.update(g=grid, lo=lower, hi=upper, mid=midpoint)
+
+    result.setdefault("g", np.asarray([]))
+    result.setdefault("lo", np.asarray([]))
+    result.setdefault("hi", np.asarray([]))
+    result.setdefault("mid", np.asarray([]))
     return result
 
 

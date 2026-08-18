@@ -17,13 +17,13 @@ from matplotlib.ticker import FixedLocator
 from matplotlib.lines import Line2D
 
 N = 167_772_160
-ours = np.load("QuadraticModel-rep/outputs/spectrum_ddp_p100_m1200_reband.npz", allow_pickle=True)
+ours = np.load("QuadraticModel-rep/outputs/spectrum_ddp_p100_m1200_hessian_raw_5M.npz", allow_pickle=True)
 paper = np.load("QuadraticModel/analysis/data/cache/spectrum_3x3.npz", allow_pickle=True)
 # raw 曲线固定从 CompleteP 版 npz 取（我们内部 tag gn_raw/hessian_raw）
-_CP_PATH = "QuadraticModel-rep/outputs/spectrum_ddp_p100_m1200_raw_completep.npz"
-if not os.path.exists(_CP_PATH):
-    raise SystemExit(f"缺少 CompleteP raw 谱 {_CP_PATH}（先跑 run_spectrum_ddp_raw_completep.sh）")
-ours_cp = np.load(_CP_PATH, allow_pickle=True)
+# _CP_PATH = "111"
+# if not os.path.exists(_CP_PATH):
+#     raise SystemExit(f"缺少 CompleteP raw 谱 {_CP_PATH}（先跑 run_spectrum_ddp_raw_completep.sh）")
+# ours_cp = np.load(_CP_PATH, allow_pickle=True)
 COL_O, COL_P = "#0072B2", "#d62728"
 
 
@@ -62,8 +62,8 @@ def draw(ax, cur, color, label, band_alpha=0.10):
 PANELS = [
     ("gn_adam", "Preconditioned Gauss-Newton", 5e0, ours, "gn_adam"),
     ("hessian_adam", "Preconditioned Hessian", 5e0, ours, "hessian_adam"),
-    ("gn_raw", "Raw Gauss-Newton (CompleteP)", 5e0, ours_cp, "gn_sgd"),
-    ("hessian_raw", "Raw Hessian (CompleteP)", 5e0, ours_cp, "hessian_sgd"),
+    ("gn_raw", "Raw Gauss-Newton (CompleteP)", 5e0, ours, "gn_sgd"),
+    ("hessian_raw", "Raw Hessian (CompleteP)", 5e0, ours, "hessian_sgd"),
 ]
 
 have = [p for p in PANELS if f"{p[0]}_x" in p[3].files]
@@ -84,6 +84,6 @@ for ax, (c, t, ytop, src, pkey) in zip(axes[0], have):
 fig.supxlabel("eigenvalue index (rank)", fontsize=10)
 fig.supylabel("eigenvalue", fontsize=10)
 fig.tight_layout()
-out = "QuadraticModel-rep/outputs/compare_p100_m1200_v7_raw_completep.png"
+out = "QuadraticModel-rep/outputs/compare_p100_m1200_5M.png"
 fig.savefig(out, dpi=140, bbox_inches="tight")
 print("saved:", out)

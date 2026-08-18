@@ -207,30 +207,43 @@ def apply_preconditioner(
     preconditioner: Dict[str, torch.Tensor],
     model: torch.nn.Module,
 ) -> torch.Tensor:
+    """应用预条件器（按 param 施加），支持两种口径：
+
+    1. **对角**（Adam / CompleteP-raw）：preconditioner[name] 是与 param 同形张量 →
+       逐元素乘 v_dict[name] * P[name]。
+
+    2. **dense-op**（Muon Kronecker）：preconditioner[name] 是 dict
+       {"Phalf": (L,d,d), "side": "left"|"right"}，把 v_dict[name] 按 muon_reshape 视作
+       (L,m,n) 逐层矩阵，施加对称半预条件器 Phalf：
+         side="right"(tall m≥n): v_mat @ Phalf    （Phalf 为 n×n）
+         side="left" (wide m<n): Phalf @ v_mat    （Phalf 为 m×m）
+       两侧（HVP 的 v 入口 + gv 出口）各调用一次 → 得 𝒫^{-1/2} H 𝒫^{-1/2}。
+       √(pre·post) 标量已并入 Phalf。
+
+    未在 preconditioner 里的 param 保持不变。
     """
-    应用 Adam 预条件器：P = diag[√ν + ε]
+    from opt import muon_reshape   # 逐层 2D reshape 约定（与优化器一致），避免循环 import
 
-    预条件器格式：
-    preconditioner[param_name] = √ν + ε
-
-    Args:
-        v: 扁平化向量
-        preconditioner: 预条件器字典
-        model: 模型（用于获取参数形状）
-
-    Returns:
-        P·v（逐元素乘法）
-    """
     v_dict = flat_to_params(v, model)
     v_precond_dict = {}
-
     for name, param in model.named_parameters():
-        if name in preconditioner and name in v_dict:
-            # 逐元素乘法
-            v_precond_dict[name] = v_dict[name] * preconditioner[name]
-        elif name in v_dict:
-            # 如果没有预条件器，保持不变
+        if name not in v_dict:
+            continue
+        P = preconditioner.get(name) if preconditioner else None
+        if P is None:
             v_precond_dict[name] = v_dict[name]
+        elif isinstance(P, dict):
+            # dense-op（Muon）：reshape → bmm → reshape 回原形
+            vm = muon_reshape(name, v_dict[name])        # (L,m,n)
+            Phalf = P["Phalf"].to(vm.dtype)
+            if P["side"] == "right":
+                out = vm @ Phalf                          # (L,m,n)@(L,n,n)
+            else:
+                out = Phalf @ vm                          # (L,m,m)@(L,m,n)
+            v_precond_dict[name] = out.reshape(param.shape)
+        else:
+            # 对角：逐元素乘
+            v_precond_dict[name] = v_dict[name] * P
 
     return params_to_flat(v_precond_dict.values(), model)
 
