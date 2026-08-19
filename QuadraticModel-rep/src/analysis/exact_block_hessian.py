@@ -153,11 +153,20 @@ class InjectedBatchOp:
 
 
 def dense_block_matrix_injected(model, batches, nb_global, l, pname, neuron_ids,
-                                kind, device, chunk=32, log=print):
-    """注入版稠密 H_bb（fp64）。每 minibatch 一次 prepare，之后 n_b 行按 chunk
-    批量。显存瓶颈是 per-lane 的 logits 尺寸张量 (K,B,T,V)，即 chunk×per 的乘积，
-    OOM 时 chunk 减半重试。返回 (H_local_sum, n_b)：**未除 nb_global**，
-    留给调用方 all_reduce 后统一归一化。"""
+                                kind, device, chunk=32, rank=0, world=1, log=print):
+    """注入版稠密 H_bb（fp64）。每 minibatch 一次 prepare，之后按 chunk 批量取行。
+
+    **行分片**：各 rank 只算自己那部分行（按 chunk 块跨步轮转），但**每个 rank 都过
+    全部 minibatch**。行不重叠 → all_reduce(SUM) 即拼成完整矩阵，数值与单卡一致。
+    ⚠ 不要同时按 rank 切 minibatch（make_local_batches 的 world/rank）和按 rank 切行：
+    那是双重切分，每卡只有「自己的 batch × 自己的行」，拼不出完整矩阵。
+
+    显存 = prepare() 的二阶图（MATH sdpa 物化 attention，∝ per，**不随 chunk 缩**）
+    + 每 chunk 的中间量（gn 分支要物化 (K,B,T,V) 的 jvp+cot，比 hessian 分支贵得多）。
+    OOM 时减半 chunk 并**重建 op**：那张二阶图是活跃引用，empty_cache() 收不走，
+    不 release 就是在已碎的分配器上原地重试（首版即栽在此，一路减半到 2）。
+
+    返回 (H_local_sum, n_b)：**未除 nb_global**，留给调用方 all_reduce 后统一归一化。"""
     ids = torch.as_tensor(list(neuron_ids), dtype=torch.long, device=device)
     d_in, _ = _INJECT_DIMS[pname](model.cfg)
     n_sel = len(neuron_ids)
@@ -165,27 +174,38 @@ def dense_block_matrix_injected(model, batches, nb_global, l, pname, neuron_ids,
     H = torch.zeros(n, n, dtype=torch.float64, device=device)
     pdtype = next(model.parameters()).dtype
     eye = torch.eye(n, dtype=pdtype, device=device)
+    # 行分片边界在进入循环前一次性定好（不随 OOM 改变），否则各 rank 的行集合会漂移
+    my_starts = list(range(rank * chunk, n, world * chunk))
+    my_rows = [(s, min(s + chunk, n)) for s in my_starts]
+    sub = chunk            # 实际每次 autograd 调用的行数，OOM 时只缩它，不动分片
     for bi, (x, y) in enumerate(batches):
         op = InjectedBatchOp(model, x, y, kind, l, pname, ids, n_sel, d_in)
         op.prepare()
-        t0, i = time.time(), 0
-        while i < n:
-            j = min(i + chunk, n)
-            try:
-                rows = op.apply_batched(eye[i:j])
-            except torch.OutOfMemoryError:
-                if chunk == 1:
-                    raise
-                chunk = max(1, chunk // 2)
-                log(f"⚠ OOM，chunk 减半 → {chunk}")
-                torch.cuda.empty_cache()
-                continue
-            H[i:j] += rows.double()
-            i = j
+        t0, done = time.time(), 0
+        for (s, e) in my_rows:
+            i = s
+            while i < e:
+                j = min(i + sub, e)
+                try:
+                    rows = op.apply_batched(eye[i:j])
+                except torch.OutOfMemoryError:
+                    if sub == 1:
+                        raise
+                    sub = max(1, sub // 2)
+                    log(f"⚠ OOM，子批减半 → {sub}（重建 op 释放二阶图）")
+                    op.release(); del op
+                    torch.cuda.empty_cache()
+                    op = InjectedBatchOp(model, x, y, kind, l, pname,
+                                         ids, n_sel, d_in)
+                    op.prepare()
+                    continue          # 重试同一段 [i, ...)，分片不变
+                H[i:j] += rows.double()
+                done += j - i
+                i = j
         op.release()
         del op
-        log(f"  batch {bi+1}/{len(batches)}  {n} 行  chunk={chunk}  "
-            f"{time.time()-t0:.1f}s")
+        log(f"  batch {bi+1}/{len(batches)}  本rank {done}/{n} 行  "
+            f"sub={sub}  {time.time()-t0:.1f}s")
     return H, n
 
 
@@ -342,6 +362,24 @@ def run_verify():
         err3 = (Hinj - ref).abs().max().item()
         print(f"[verify {kind:7s}] 注入 vs 暴力 max|Δ|={err3:.3e}  (tol={tol:.1e})")
         assert err3 < tol, f"{kind} 注入路径对拍失败"
+        # 行分片：模拟 world=4 的 4 个 rank 各算自己的行，求和应逐位等于单卡结果
+        # （这是 8 卡跑法的核心正确性前提：行不重叠 → SUM 即拼接）
+        Wsim = 4
+        Hsum = None
+        for r in range(Wsim):
+            Hr, _ = dense_block_matrix_injected(
+                model, [(x, y)], nb_global=1, l=1, pname="mlp_up",
+                neuron_ids=[1, 3, 6], kind=kind, device=torch.device("cpu"),
+                chunk=5, rank=r, world=Wsim, log=lambda *a: None)
+            Hsum = Hr if Hsum is None else Hsum + Hr
+        # 与未分片（world=1）的原始（未对称化）结果比
+        Hraw, _ = dense_block_matrix_injected(
+            model, [(x, y)], nb_global=1, l=1, pname="mlp_up",
+            neuron_ids=[1, 3, 6], kind=kind, device=torch.device("cpu"),
+            chunk=5, log=lambda *a: None)
+        err4 = (Hsum - Hraw).abs().max().item()
+        print(f"[verify {kind:7s}] 行分片(world={Wsim}) vs 单卡 max|Δ|={err4:.3e}")
+        assert err4 == 0.0, f"{kind} 行分片结果与单卡不一致（分片/拼接有误）"
     print("✅ verify 通过")
 
 
@@ -397,13 +435,16 @@ def main():
     model, cfg, optim_name, _precond, _precond_raw = load_checkpoint(
         args.ckpt, args.ema, device)
 
+    # ⚠ 并行维度是**行**而不是 minibatch（见 dense_block_matrix_injected）：
+    # 这里传 world=1, rank=0 让每个 rank 都拿到**全部** minibatch，
+    # 再由行分片把 n_b 行分给各 rank。两处都切 = 双重切分，拼不出完整矩阵。
     batches, nb_global = make_local_batches(
-        cfg, args.n_tokens, world, rank, device, args.seed, per=args.per)
-    log(f"local batches={len(batches)} nb_global={nb_global} "
+        cfg, args.n_tokens, 1, 0, device, args.seed, per=args.per)
+    log(f"batches={len(batches)}（每 rank 全量）nb_global={nb_global} "
         f"tokens={nb_global*args.per*cfg.seq_len:,}")
 
-    # 神经元选取必须全 rank 一致：rank0 选好后广播（各 rank 的 batch 不同，
-    # 独立按 GN trace 打分会选出不同神经元 → 拼出来的 H 是错的）
+    # 神经元选取必须全 rank 一致。现在各 rank 的 batches 相同，打分结果本就一致；
+    # 仍保留 broadcast 作为保险（显式 --neurons 时是恒等操作）。
     neuron_ids = pick_neurons(model, batches, args.layer, args.param,
                               args.neurons, device, log=log)
     if ddp:
@@ -413,14 +454,16 @@ def main():
     d_in, _ = _INJECT_DIMS[args.param](cfg)
     n_b = len(neuron_ids) * d_in
     log(f"neurons={neuron_ids}  d_in={d_in}  H 为 {n_b}² fp64 "
-        f"≈{n_b**2*8/2**30:.2f} GiB")
+        f"≈{n_b**2*8/2**30:.2f} GiB"
+        + (f"；行分片：每 rank ≈{n_b//world} 行" if world > 1 else ""))
 
     t0 = time.time()
     H, _ = dense_block_matrix_injected(
         model, batches, nb_global, args.layer, args.param, neuron_ids,
-        args.kind, device, chunk=args.chunk, log=log)
+        args.kind, device, chunk=args.chunk, rank=rank, world=world, log=log)
     if ddp:
-        dist.all_reduce(H, op=dist.ReduceOp.SUM)   # Σ(每 minibatch 均值)
+        # 行不重叠 → SUM 即按行拼接；每 minibatch 的贡献已是逐 token 均值
+        dist.all_reduce(H, op=dist.ReduceOp.SUM)
     H = (H / nb_global).cpu()
     sym_resid = float((H - H.T).abs().max())
     H = 0.5 * (H + H.T)
