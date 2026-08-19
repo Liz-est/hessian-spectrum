@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 # 带 L 首轴的、逐层可切的张量
 LAYER_PARAMS = ("attn_q", "attn_k", "attn_v", "attn_head", "mlp_up", "mlp_head")
 ATTN_PARAMS = ("attn_q", "attn_k", "attn_v", "attn_head")
@@ -86,6 +88,85 @@ class Layer:
     def slices_of(self, by_name: dict):
         """从 {param_name: 与该参数同形的张量} 里取出本块各段的 flat 视图。"""
         return [by_name[s.param].reshape(-1)[s.start:s.stop] for s in self.specs]
+
+
+class IndexBlock:
+    """坐标子集块：由任意（可不连续的）flat 坐标集合组成的块。
+
+    与 Layer 的区别：Layer 的 specs 是连续区间 [start,stop)，而"某几个输出神经元
+    的全部输入坐标"这类子集在 flat 布局里是 stride 散点（如 mlp_up (L,D,M) 里
+    单个神经元 m 是 stride=M 的 D 个点），用区间描述需要 n 段长度 1 的 Spec，
+    python 循环成为瓶颈。IndexBlock 直接持有索引张量，gather/scatter 全向量化。
+
+    indices: 有序 [(param_name, LongTensor flat 坐标)]，块内坐标 = 各段依序拼接。
+    对外接口与 Layer 对齐（name/numel/params/split/slices_of），hvp_layers 的
+    SharedBatchOp 可直接使用；另有 fill()（代替 _zero_filled 的区间写入）。
+    ⚠ 暂不支持预条件器切段（_precond_block 走 specs），只能 precond=None 使用。
+    """
+
+    def __init__(self, name, indices):
+        self.name = name
+        self.indices = [(pn, torch.as_tensor(ix, dtype=torch.long).reshape(-1))
+                        for pn, ix in indices]
+        self.numel = sum(ix.numel() for _, ix in self.indices)
+        seen = []
+        for pn, _ in self.indices:
+            if pn not in seen:
+                seen.append(pn)
+        self.params = tuple(seen)
+
+    def __repr__(self):
+        return f"IndexBlock({self.name}, numel={self.numel:,}, params={self.params})"
+
+    def split(self, v):
+        """块向量 (numel,) → 按 indices 顺序切成的分段列表（视图，不拷贝）。"""
+        out, off = [], 0
+        for _, ix in self.indices:
+            out.append(v[off:off + ix.numel()])
+            off += ix.numel()
+        return out
+
+    def slices_of(self, by_name):
+        """从 {param_name: 与该参数同形的张量} 里取出本块各坐标的值。"""
+        return [by_name[pn].reshape(-1)[ix.to(by_name[pn].device)]
+                for pn, ix in self.indices]
+
+    def fill(self, v_block, pmap):
+        """块向量 → {param_name: 同形张量，块外为 0}（= P_b v_b）。"""
+        out = {pn: torch.zeros_like(pmap[pn]) for pn in self.params}
+        for seg, (pn, ix) in zip(self.split(v_block), self.indices):
+            out[pn].reshape(-1)[ix.to(seg.device)] = seg
+        return out
+
+
+# 每输出神经元一列的张量：pname -> (d_in, d_out)。这四个张量的 flat 布局
+# （层内）都是 in 维 stride=d_out、out 维 stride=1，见 model.Transformer.__init__。
+_NEURON_DIMS = {
+    "mlp_up":    lambda cfg: (cfg.D,          cfg.M),
+    "mlp_head":  lambda cfg: (cfg.M,          cfg.D),
+    "attn_v":    lambda cfg: (cfg.D,          cfg.H * cfg.K),
+    "attn_head": lambda cfg: (cfg.H * cfg.K,  cfg.D),
+}
+
+
+def neuron_subblock(model, l, pname, neuron_ids, name=None):
+    """第 l 层 pname 的「若干输出神经元 × 全部输入坐标」子块。
+
+    块内坐标 neuron-major：idx = k*d_in + d（k=第几个选定神经元，d=输入坐标），
+    这样 Hessian 热图的对角块正好是各神经元自己的 d_in×d_in 块。
+    支持 mlp_up / mlp_head / attn_v / attn_head（attn_q/k 的自然 unit 是整头
+    D·K 维，不是单神经元，不在此支持）。
+    """
+    pname = canon(pname)
+    if pname not in _NEURON_DIMS:
+        raise SystemExit(f"neuron_subblock 不支持 {pname}（可用 {list(_NEURON_DIMS)}）")
+    d_in, d_out = _NEURON_DIMS[pname](model.cfg)
+    ids = torch.as_tensor(list(neuron_ids), dtype=torch.long)
+    base = l * d_in * d_out
+    # (k, d) → base + d*d_out + m_k
+    idx = base + torch.arange(d_in).unsqueeze(0) * d_out + ids.unsqueeze(1)  # (n_sel, d_in)
+    return IndexBlock(name or f"layer{l:02d}.{pname}.n{len(ids)}",
+                      [(pname, idx.reshape(-1))])
 
 
 # --------------------------------------------------------------------------

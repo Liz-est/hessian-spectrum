@@ -40,6 +40,8 @@ _MATH_SDPA = [SDPBackend.MATH]
 
 def _zero_filled(block, v_block, pmap):
     """把块向量 v_block 写进「与各参数同形、块外为 0」的 dict（= P_b v_b）。"""
+    if hasattr(block, "fill"):          # IndexBlock：散点坐标，向量化写入
+        return block.fill(v_block, pmap)
     out = {}
     for pn in block.params:
         out[pn] = torch.zeros_like(pmap[pn])
@@ -162,6 +164,56 @@ class SharedBatchOp:
 
         out = _gather_block(block, dict(zip(block.params, gv)))   # P_bᵀ ⋯
         return _precond_block(block, out, self.precond)           # 左预条件
+
+    def apply_batched(self, block, V):
+        """批量版 apply：V (K, n_b) → (K, n_b)，一次 autograd 调用算 K 行。
+
+        技巧：<grads, v> 对 θ 的导数 = autograd.grad(outputs=grads, inputs=θ,
+        grad_outputs=v)，故批量只需把 grad_outputs 堆上 K 维 + is_grads_batched=True
+        （内部走 vmap）。GN 的 J·v 一步同理（outputs=gu, inputs=u）。
+        ⚠ 仅支持 precond=None（IndexBlock 无 specs，预条件切段不适用）。
+        """
+        assert self._ready, "先调用 prepare()"
+        assert self.precond is None, "apply_batched 仅支持无预条件"
+        K = V.shape[0]
+        pmap = self.pmap
+        # P_b v_k：每参数堆成 (K, *shape)
+        Vf = {pn: torch.zeros((K,) + pmap[pn].shape,
+                              dtype=V.dtype, device=V.device)
+              for pn in block.params}
+        for k in range(K):
+            filled = _zero_filled(block, V[k], pmap)
+            for pn in block.params:
+                Vf[pn][k] = filled[pn]
+
+        binputs = [pmap[pn] for pn in block.params]
+
+        if self.kind == "gn":
+            jvp = torch.autograd.grad(
+                outputs=[self.gu_map[pn] for pn in block.params],
+                inputs=self.u,
+                grad_outputs=[Vf[pn] for pn in block.params],
+                retain_graph=True, is_grads_batched=True,
+            )[0]                                                   # (K,B,T,V)
+            jvp = jvp - (self.q.unsqueeze(0) * jvp).sum(-1, keepdim=True)
+            cot = self.q.unsqueeze(0) * jvp / self.y.numel()
+            gv = torch.autograd.grad(
+                outputs=self.logits, inputs=binputs, grad_outputs=cot,
+                retain_graph=True, is_grads_batched=True,
+            )                                                      # 各 (K,*shape)
+        else:
+            gv = torch.autograd.grad(
+                outputs=[self.grads_map[pn] for pn in block.params],
+                inputs=binputs,
+                grad_outputs=[Vf[pn] for pn in block.params],
+                retain_graph=True, is_grads_batched=True,
+            )                                                      # 各 (K,*shape)
+
+        gv_map = {pn: g for pn, g in zip(block.params, gv)}
+        rows = []
+        for k in range(K):
+            rows.append(_gather_block(block, {pn: gv_map[pn][k] for pn in block.params}))
+        return torch.stack(rows)
 
     def release(self):
         for attr in ("logits", "q", "u", "gu", "gu_map", "grads", "grads_map", "inputs"):

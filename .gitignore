@@ -167,6 +167,9 @@ sco-backup/
 # try
 /toy_models/new_metric/
 
+# 上游仓库的本地 clone（各自带 .git，仅作参考）
+/tmp
+
 # replication
 /replication
 /QuadraticModel
