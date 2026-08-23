@@ -21,9 +21,119 @@ import torch
 
 
 # ============================================================================
-# Muon 数学（NS5 正交化 + C5 预条件器递推），训练与谱分析共用（不建 muon.py）。
+# Muon 数学（NS5 正交化 + C5 预条件器递推），训练与谱分析共用。
 # ============================================================================
-_NS_ABC = (3.4445, -4.7750, 2.0315)     # Moonlight/Muon quintic 系数
+_NS_ABC = (3.4445, -4.7750, 2.0315)     # Moonlight/Muon quintic 系数（训练用）
+
+
+# Polar Express 系数（arXiv 2505.16932, safety_factor=1.05 缩放）—— Gram NS 递推用。
+# 复刻自 Dao-AILab/gram-newton-schulz/gram_newton_schulz/coefficients.py。
+_POLAR_EXPRESS_RAW = [
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+]
+_SF = 1.05
+POLAR_EXPRESS_COEFFICIENTS = [
+    (a / _SF, b / _SF**3, c / _SF**5)
+    for (a, b, c) in _POLAR_EXPRESS_RAW
+]
+
+
+def gram_newton_schulz_C5(G, steps=5, eps_ns=1e-7, reset_iterations=(2,)):
+    """Gram Newton-Schulz 迭代求 C5 = (G^T G)^{-1/2}（tall）或 (G G^T)^{-1/2}（wide）。
+
+    复刻自 Dao-AILab/gram-newton-schulz（POLAR_EXPRESS 系数），保留 reset 机制：
+    每 reset_iterations 步从更新后的 X 重算 Gram 矩阵 R，防止近奇异矩阵上的数值爆炸。
+
+    数学：先归一化 X = G/‖G‖，Gram 迭代得 Q = (X^T X)^{-1/2} = ‖G‖·(G^T G)^{-1/2}，
+    除以 ‖G‖ 恢复：C5 = Q / ‖G‖。
+
+    G 为单层 2D 矩阵（fp32）。返回 (C5, side)，side ∈ {'right'(tall), 'left'(wide)}。
+    """
+    tall = G.size(-2) >= G.size(-1)   # m≥n=tall（与 eigh 版 side 判定对齐）
+    norm_G = G.float().norm()
+    X = G.float() / (norm_G + eps_ns)   # 归一化
+
+    if tall:
+        R = X.mT @ X              # (n,n)
+    else:
+        R = X @ X.mT              # (m,m)
+    R = 0.5 * (R + R.mT)
+
+    d = R.size(-1)
+    I = torch.eye(d, dtype=R.dtype, device=R.device)
+    Q = None
+    reset_set = set(reset_iterations)
+    coeffs = POLAR_EXPRESS_COEFFICIENTS[:steps]
+
+    for i, (a, b, c) in enumerate(coeffs):
+        if i in reset_set and i != 0:
+            if tall:
+                X = X @ Q
+                R = X.mT @ X
+            else:
+                X = Q @ X
+                R = X @ X.mT
+            R = 0.5 * (R + R.mT)
+            Q = None
+
+        Z = b * R + c * (R @ R)
+        Z = 0.5 * (Z + Z.mT)
+
+        if i == 0 or i in reset_set:
+            Q = Z + a * I
+        else:
+            # 参考代码: sym_baddbmm(Q, Z, C=Q, beta=a) = Q@Z + a*Q（乘积累积，
+            # 每步都作用在 R 的特征值上——正是收敛到 R^{-1/2} 的关键）
+            Q = Q @ Z + a * Q
+
+        if i < len(coeffs) - 1 and (i + 1) not in reset_set:
+            RZ = R @ Z + a * R
+            R_new = Z @ RZ + a * RZ
+            R = 0.5 * (R_new + R_new.mT)
+
+    # 除以归一化因子：Q = ‖G‖·C5 → C5 = Q/‖G‖
+    C5 = Q / norm_G
+    return C5, ("right" if tall else "left")
+
+
+def muon_ns5_C5(G, steps=5, eps_ns=1e-7):
+    """训练端 NS5 的**隐含预条件器** C₅，使 NS5(G) = G·C₅（tall）或 C₅·G（wide）。
+
+    定义 NS5 的每步为
+        Xₖ₊₁ = a·Xₖ + (b·Aₖ + c·Aₖ²)·Xₖ,  Aₖ = XₖXₖᵀ,
+    等价于右乘一个 Xₖ 的 Gram 的多项式：Xₖ₊₁ = Xₖ·Pₖ，Pₖ = a·I + b·Rₖ + c·Rₖ²，
+    Rₖ = XₖᵀXₖ（tall）。5 步累积 Q = ∏ₖ Pₖ，则 NS5(G) = X·Q = (G/‖G‖)·Q，
+    故 C₅ = Q/‖G‖。同理 wide 用 Rₖ = XₖXₖᵀ 左乘。
+
+    **数值稳定的关键**：多项式在**归一化后 Gram 矩阵**（谱 ⊂ [0,1]）上累积，而非
+    在每个奇异值上独立跑标量高次递推——数学上与标量递推恒等（同一 Moonlight NS5），
+    但不会因 σ≪1 时 (1/σ²)² 溢出。用 Moonlight 系数 _NS_ABC、**无 reset**（训练端
+    NS5 就没有 reset）。C₅ 严格对称且在实测真实 buffer 上正定。
+
+    G 为单层 2D 矩阵（fp32）。返回 (C5, side)，side∈{'right'(tall),'left'(wide)}。
+    """
+    a, b, c = _NS_ABC
+    tall = G.size(-2) >= G.size(-1)
+    Gd = G.double()
+    norm_G = Gd.norm()
+    X = Gd / (norm_G + eps_ns)
+    R = X.mT @ X if tall else X @ X.mT       # 小边归一化 Gram，谱 ⊂ [0,1]
+    R = 0.5 * (R + R.mT)
+    d = R.size(-1)
+    I = torch.eye(d, dtype=R.dtype, device=R.device)
+    Q = I.clone()
+    for _ in range(steps):
+        P = a * I + b * R + c * (R @ R)      # 本步多项式（R 的多项式 → 对称）
+        Q = Q @ P                            # 乘积累积（P 互相对易 → Q 仍对称）
+        R = P @ R @ P                        # R_{k+1} = P Rₖ P（= Xₖ₊₁ 的 Gram）
+        R = 0.5 * (R + R.mT)
+    C5 = Q / norm_G                          # 还原归一化：NS5(G)=X·Q → C₅=Q/‖G‖
+    C5 = 0.5 * (C5 + C5.mT)
+    return C5.to(G.dtype), ("right" if tall else "left")
 
 
 def zeropower_via_newtonschulz5(G, steps=5):
@@ -45,52 +155,51 @@ def zeropower_via_newtonschulz5(G, steps=5):
     return X.to(G.dtype)
 
 
-def muon_precond_C5(G, steps=5, eps_ns=1e-7):
-    """按 markdown 递推求 C₅ = P⁻¹（NS5-忠实版，非理想极分解）。
-
-    设 X_k = G·C_k（tall，右乘）或 X_k = C_k·G（wide，左乘），C_k 为 S 的多项式
-    （对称、与 S 交换），则 NS5 迭代 X_{k+1}=a·X_k+b·(X_kX_kᵀ)X_k+c·(X_kX_kᵀ)²X_k
-    恰好塌缩为标量递推：
-        C_{k+1} = a·C_k + b·S·C_k³ + c·S²·C_k⁵,   C_0 = I/α,  α = ‖G‖_F + eps_ns
-    tall(m≥n): S = GᵀG (n×n)，side='right'；wide: S = GGᵀ (m×m)，side='left'。
-    返回 (C5, side)。C5 即优化器右/左乘的预条件器（含 NS5 近似误差）。fp32。
-
-    ⚠ G 为**单层 2D 矩阵**（分析端逐层调用）；α 为该层 Frobenius 范数，与 batched
-    NS5 的逐层归一化一致。
-    """
-    a, b, c = _NS_ABC
-    G = G.float()
-    m, n = G.shape[-2], G.shape[-1]
-    alpha = G.norm() + eps_ns
-    if m >= n:
-        S = G.transpose(-2, -1) @ G      # (n,n) = GᵀG
-        side, d = "right", n
-    else:
-        S = G @ G.transpose(-2, -1)      # (m,m) = GGᵀ
-        side, d = "left", m
-    C = torch.eye(d, dtype=G.dtype, device=G.device) / alpha    # C_0 = I/α
-    S2 = S @ S
-    for _ in range(steps):
-        C2 = C @ C
-        C3 = C2 @ C
-        C5 = C3 @ C2
-        C = a * C + b * (S @ C3) + c * (S2 @ C5)
-    return C, side
-
-
 def muon_Phalf(G, pre, post, steps=5):
     """谱分析用的对称半预条件器：Phalf = √(pre·post) · C₅^{1/2}（小边 d×d）。
 
     G = 存下的（已 pre-scaled）动量 buffer 的逐层 2D 矩阵。HVP 两侧各施加一次
     Phalf → 全 metric = pre·post·C₅ = post·C₅(G₀)（与 Adam 的 pre·post/√ν̂ 同构）。
     返回 (Phalf, side)，side∈{'right'(tall),'left'(wide)}。
+
+    C₅ 用 muon_ns5_C5：训练端 NS5 隐含的预条件器（忠实复现，非 eigh 的精确
+    (GᵀG)^{-1/2}——后者带训练里不存在的 rel_floor 正则，且在真实 buffer 上差 2–8×）。
     """
-    C5, side = muon_precond_C5(G, steps)
+    C5, side = muon_ns5_C5(G, steps)
     C5 = 0.5 * (C5 + C5.transpose(-2, -1))                      # 对称化
-    evals, evecs = torch.linalg.eigh(C5)
-    evals = evals.clamp_min(0.0)
-    C5_half = (evecs * evals.sqrt()) @ evecs.transpose(-2, -1)   # C₅^{1/2}
+    C5_half = _sym_psd_sqrt(C5)                                  # 抗病态对称平方根
     return math.sqrt(pre * post) * C5_half, side
+
+
+def _sym_psd_sqrt(A):
+    """对称半正定矩阵的对称平方根 A^{1/2}，抗病态。
+
+    ⚠ C₅ 逼近正交投影（特征值聚在 {0,1}），高度简并 → 分解易不收敛。且 GPU
+    LAPACK（cusolver）对简并矩阵的 eigh/svd 都常崩（error 990/1010/1024…，
+    lr0.32 ckpt 全 rank 挂在此）。两条应对：
+      (a) **搬到 CPU 算分解**：CPU LAPACK 对病态矩阵远比 cusolver 鲁棒（小 d×d，开销可忽略）；
+      (b) 分级兜底：eigh(fp64) → 加递增 jitter 破简并 → SVD。
+    结果搬回原 device/dtype。"""
+    dt, dev = A.dtype, A.device
+    Ad = A.detach().double().cpu()                              # CPU + fp64
+    Ad = 0.5 * (Ad + Ad.transpose(-2, -1))
+    d = Ad.shape[-1]
+    eye = torch.eye(d, dtype=Ad.dtype)
+    H = None
+    for jit in (0.0, 1e-9, 1e-7, 1e-5, 1e-3):
+        try:
+            evals, evecs = torch.linalg.eigh(Ad + jit * eye)
+            evals = (evals - jit).clamp_min(0.0)               # 抵消 jitter 偏移
+            H = (evecs * evals.sqrt()) @ evecs.transpose(-2, -1)
+            break
+        except torch._C._LinAlgError:
+            continue
+    if H is None:
+        # SVD 兜底：A 对称半正定 → A = U diag(S) Uᵀ（U=V），A^{1/2}=U diag(√S) Uᵀ
+        U, S, _ = torch.linalg.svd(Ad)
+        H = (U * S.sqrt()) @ U.transpose(-2, -1)
+    H = 0.5 * (H + H.transpose(-2, -1))
+    return H.to(device=dev, dtype=dt)
 
 
 # 每个权重参数的「逐层 2D 矩阵」reshape → (L, m, n)。stacked 参数首维为层 L；
@@ -188,6 +297,10 @@ class CompletePAdam:
         return {name: (self.nu[i] / denom_b2).clone()
                 for i, (name, _, _, _) in enumerate(self.groups)}
 
+    def state_named(self):
+        """[(name, ν)]：优化器状态 EMA 用（Adam 追踪二阶矩 ν）。"""
+        return [(name, self.nu[i]) for i, (name, _, _, _) in enumerate(self.groups)]
+
     def state_for_ckpt(self):
         """存 checkpoint：ν 状态 + 标量 + 每组 pre/post，供谱分析重建预条件器。"""
         return dict(
@@ -204,83 +317,121 @@ class CompletePAdam:
         )
 
 
-class CompletePMuon:
-    """
-    在 (name, param, pre, post) 四元组列表上运行的 CompleteP-Muon（Moonlight NS5）。
+class Muon:
+    """本仓库 "muon" 优化器：embd/head 走 CompletePAdam（沿用 Adam+CompleteP），
+    其余 6 层（attn_q/k/v/attn_head、mlp_up/mlp_head）走 Moonlight NS5 谱正交化。
 
-    结构对齐 CompletePAdam（同吃 lr_groups、同 CosineSchedule、step() 返回 base_lr），
-    差别在更新规则：
-      - 梯度 pre 缩放：u = pre·g（与 Adam 对称；pre 会在 msign 里精确相消，但保留于
-        buffer 使动量与 Adam 同口径、并让存下的 buffer 直接可用于分析端 √(pre·post)）。
+    动机：纯 Muon 在 embedding/lm_head（秩结构与 softmax 类不平衡）上白化几乎无效
+    且 rms_match 口径难调；这两层沿用 Adam+CompleteP 的成熟口径，隐藏层矩阵仍由
+    Muon 谱正交化。embd/head 与隐藏层各自独立的 base_lr（adam_lr vs lr）与
+    CosineSchedule（同 total_steps/schedule_kwargs）。
+
+    隐藏层更新规则（逐层，与 Adam 对称的 pre 缩放）：
+      - 梯度 pre 缩放：u = pre·g（pre 在 msign 里精确相消，但保留于 buffer 使动量与
+        Adam 同口径、并让存下的 buffer 直接可用于分析端 √(pre·post)）。
       - 动量 buffer：buf ← momentum·buf + u（Moonlight 约定）。
       - 更新方向：g_eff = u + momentum·buf（nesterov）或 buf；逐层 msign = NS5(g_eff)。
-      - 更新：Δθ = −base_lr · post · scale · msign，scale=1（默认）或 0.2·√max(m,n)
-        （rms_match=True，Moonlight RMS 匹配口径）。
-    stacked 参数按 muon_reshape 拆成 (L,m,n) 逐层正交化。无 weight decay。
+      - 更新：Δθ = −base_lr · post · scale · msign。
+    两套「每层尺度」互斥旋钮（completep 与 rms_match）：
+      - completep=True：用 CompleteP 的 (pre,post) 乘子（u=pre·g，Δθ 带 post）。
+      - completep=False：忽略 (pre,post)（置 1），改用 Moonlight RMS 匹配
+        scale=0.2·√max(m,n)（要求 rms_match=True），lr 轴与 Adam 对齐（RMS≈0.2）。
+    rms_match 在 completep=True 时仍可叠加，但常规二选一。stacked 参数按 muon_reshape
+    拆成 (L,m,n) 逐层正交化。无 weight decay。
+
+    state_for_ckpt 记 name="muon" + adam_names/muon_names + adam/muon 子状态，
+    谱分析据此对每层分别用 Adam 对角 / Muon dense-op 预条件器（precond dict 混装，
+    hvp 已按 name 分派；见 spectrum_ddp.load_checkpoint）。
     """
-    def __init__(self, lr_groups, lr, total_steps,
-                 momentum=0.95, nesterov=True, ns_steps=5, rms_match=False,
+    ADAM_LAYERS = ("embd", "head")
+
+    def __init__(self, lr_groups, lr, adam_lr, total_steps,
+                 b1=0.9, b2_pct=0.01, eps=1e-8,
+                 momentum=0.95, nesterov=True, ns_steps=5,
+                 muon_completep=True, muon_rms_match=False,
                  schedule_kwargs=None):
-        self.groups = lr_groups
-        self.names = [name for name, _, _, _ in lr_groups]
+        # embd/head → 内部 CompletePAdam；其余 6 层 → Muon NS5（本类内联）
+        adam_groups = [g for g in lr_groups if g[0] in self.ADAM_LAYERS]
+        self.muon_groups = [g for g in lr_groups if g[0] not in self.ADAM_LAYERS]
+        self.adam = CompletePAdam(adam_groups, lr=adam_lr, total_steps=total_steps,
+                                  b1=b1, b2_pct=b2_pct, eps=eps,
+                                  schedule_kwargs=schedule_kwargs)
+        self.adam_names = [g[0] for g in adam_groups]
+        self.muon_names = [g[0] for g in self.muon_groups]
+        # 隐藏层 Muon 状态
         self.lr = lr
         self.momentum = momentum
         self.nesterov = nesterov
         self.ns_steps = ns_steps
-        self.rms_match = rms_match
+        self.completep = muon_completep
+        self.rms_match = muon_rms_match
         self.schedule = CosineSchedule(total_steps, **(schedule_kwargs or {}))
         self.count = 0
-        self.buf = [torch.zeros_like(p, dtype=torch.float32) for _, p, _, _ in self.groups]
+        self.buf = [torch.zeros_like(p, dtype=torch.float32) for _, p, _, _ in self.muon_groups]
 
     @torch.no_grad()
     def step(self):
+        blr_a, _ = self.adam.step()                             # embd/head 走 Adam
         self.count += 1
         base_lr = self.schedule(self.count) * self.lr
-        for i, (name, p, pre, post) in enumerate(self.groups):
+        for i, (name, p, pre, post) in enumerate(self.muon_groups):
             if p.grad is None:
                 continue
-            u = p.grad.detach().float() * pre                   # pre 缩放（对称 Adam）
+            # completep 关时忽略 (pre,post) 乘子（置 1），纯靠 rms_match 定每层尺度
+            pre_eff = pre if self.completep else 1.0
+            post_eff = post if self.completep else 1.0
+            u = p.grad.detach().float() * pre_eff               # pre 缩放（对称 Adam）
             self.buf[i].mul_(self.momentum).add_(u)             # buf ← mom·buf + u
             g_eff = u.add(self.buf[i], alpha=self.momentum) if self.nesterov else self.buf[i]
             # 逐层 2D reshape → NS5 正交化（batched 对 (L,m,n) 的最后两维）
             g2d = muon_reshape(name, g_eff)                     # (L,m,n)
             msign = zeropower_via_newtonschulz5(g2d, self.ns_steps)
+            scale = 1.0
             if self.rms_match:
                 m2, n2 = g2d.shape[-2], g2d.shape[-1]
-                scale = 0.2 * math.sqrt(max(m2, n2))
-            else:
-                scale = 1.0
+                scale *= 0.2 * math.sqrt(max(m2, n2))
             upd = msign.reshape(p.shape).to(p.dtype)
-            p.add_(upd, alpha=-base_lr * post * scale)
-        return base_lr
+            p.add_(upd, alpha=-base_lr * post_eff * scale)
+        return blr_a, base_lr
 
     def zero_grad(self, set_to_none=True):
-        for _, p, _, _ in self.groups:
+        self.adam.zero_grad(set_to_none)
+        for _, p, _, _ in self.muon_groups:
             if set_to_none:
                 p.grad = None
             elif p.grad is not None:
                 p.grad.zero_()
 
-    def get_buf(self):
-        """返回 {name: buf}（已 pre-scaled 的动量 buffer），供 EMA 与谱分析。"""
-        return {name: self.buf[i].clone()
-                for i, (name, _, _, _) in enumerate(self.groups)}
+    def state_named(self):
+        """[(name, state)]：embd/head 给 ν、其余 6 层给 buf；供优化器状态 EMA（混装）。"""
+        muon_state = [(name, self.buf[i])
+                      for i, (name, _, _, _) in enumerate(self.muon_groups)]
+        return self.adam.state_named() + muon_state
 
-    def state_for_ckpt(self):
-        """存 checkpoint：动量 buffer（逐组）+ 标量 + 每组 pre/post，供谱分析重建
-        Muon 预条件器 √(pre·post)·C₅^{1/2}（见 spectrum_ddp.build_muon_precond）。"""
+    def _muon_state_for_ckpt(self):
+        """隐藏层 Muon 子状态：动量 buffer + 标量 + 每层 pre/post，供谱分析重建
+        dense-op 预条件器 √(pre·post)·C₅^{1/2}（见 spectrum_ddp._muon_precond_from_buf）。"""
         return dict(
-            name="muon",
             count=self.count,
             lr=self.lr,
             momentum=self.momentum,
             nesterov=self.nesterov,
             ns_steps=self.ns_steps,
             rms_match=self.rms_match,
-            buf={name: self.buf[i].cpu() for i, (name, _, _, _) in enumerate(self.groups)},
-            pre={name: pre for name, _, pre, _ in self.groups},
-            post={name: post for name, _, _, post in self.groups},
+            completep=self.completep,
+            buf={name: self.buf[i].cpu() for i, (name, _, _, _) in enumerate(self.muon_groups)},
+            pre={name: pre for name, _, pre, _ in self.muon_groups},
+            post={name: post for name, _, _, post in self.muon_groups},
             base_lr_final=self.schedule(self.count) * self.lr,
+        )
+
+    def state_for_ckpt(self):
+        return dict(
+            name="muon",
+            adam_names=list(self.adam_names),
+            muon_names=list(self.muon_names),
+            adam=self.adam.state_for_ckpt(),
+            muon=self._muon_state_for_ckpt(),
         )
 
 
@@ -307,70 +458,3 @@ class EMA:
     def state_for_ckpt(self):
         return {str(p): {name: v.cpu() for name, v in self.ema[p].items()}
                 for p in self.pct}
-
-
-if __name__ == "__main__":
-    import model as M
-    from torch.nn.attention import sdpa_kernel, SDPBackend
-    torch.manual_seed(0)
-
-    # ---- 1. NS5 & C5 一致性自检 ----
-    print("=" * 70)
-    print("1. NS5 正交化 & C₅ 递推自检")
-    for (m, n) in [(1024, 1024), (2048, 512), (512, 2048)]:
-        G = torch.randn(m, n)
-        msign = zeropower_via_newtonschulz5(G, 5)          # ≈ UVᵀ
-        # 奇异值应 ≈ 1（正交化）
-        sv = torch.linalg.svdvals(msign.float())
-        # C₅ 一致性：X₅ = G·C₅（tall）或 C₅·G（wide）应 ≈ NS5(G)
-        C5, side = muon_precond_C5(G, 5)
-        X5 = G @ C5 if side == "right" else C5 @ G
-        rel = (X5 - msign.float()).norm() / (msign.float().norm() + 1e-9)
-        # Phalf 对称性 & Phalf·C₅⁻¹·Phalf ≈ pre·post·I
-        Phalf, side2 = muon_Phalf(G, pre=2.0, post=3.0, steps=5)
-        C5inv = torch.linalg.inv(C5)
-        chk = Phalf @ C5inv @ Phalf                        # 应 ≈ pre·post·I = 6·I
-        eye_err = (chk - 6.0 * torch.eye(chk.size(0))).norm() / chk.norm()
-        print(f"  G({m}x{n}) side={side}: σ(msign)∈[{sv.min():.3f},{sv.max():.3f}]  "
-              f"‖X₅−NS5‖/‖NS5‖={rel:.2e}  Phalz对称={torch.allclose(Phalf,Phalf.T,atol=1e-4)}  "
-              f"Phalf·C₅⁻¹·Phalf≈6I err={eye_err:.2e}")
-
-    # ---- 2. CompletePMuon 数值自检 ----
-    print("=" * 70)
-    print("2. CompletePMuon 训练 3 步自检")
-    cfg = M.TransformerConfig(D=64, L=2, M=128, H=2, K=32, V=128, seq_len=16)
-    net = M.Transformer(cfg)
-    opt = CompletePMuon(net.lr_groups(), lr=1e-2, total_steps=100)
-    x = torch.randint(0, cfg.V, (2, cfg.seq_len))
-    for step in range(3):
-        opt.zero_grad()
-        with sdpa_kernel([SDPBackend.MATH]):
-            _, loss = net(x, x)
-        loss.backward()
-        # 记录 head 更新前后差，验证 ‖Δθ‖ 与 base_lr·post 量级
-        head_before = net.head.detach().clone()
-        blr = opt.step()
-        dnorm = (net.head.detach() - head_before).norm().item()
-        print(f"  step {step+1}: loss={loss.item():.4f} base_lr={blr:.3e} ‖Δhead‖={dnorm:.3e}")
-
-    # pre 相消验证：msign(pre·G) == msign(G)
-    G = torch.randn(256, 256)
-    m1 = zeropower_via_newtonschulz5(G, 5)
-    m2 = zeropower_via_newtonschulz5(7.3 * G, 5)
-    print(f"  pre 相消: ‖msign(G)−msign(7.3·G)‖/‖msign(G)‖="
-          f"{(m1-m2).norm()/m1.norm():.2e}  (应≈0)")
-
-    # ---- 3. CompletePAdam 回归自检（不破坏原有）----
-    print("=" * 70)
-    print("3. CompletePAdam 回归")
-    net2 = M.Transformer(cfg)
-    opt2 = CompletePAdam(net2.lr_groups(), lr=1e-3, total_steps=100)
-    for step in range(3):
-        opt2.zero_grad()
-        with sdpa_kernel([SDPBackend.MATH]):
-            _, loss = net2(x, x)
-        loss.backward()
-        blr, b2 = opt2.step()
-        print(f"  step {step+1}: loss={loss.item():.4f} base_lr={blr:.3e} beta2={b2:.5f}")
-    print(f"  state name={opt2.state_for_ckpt()['name']}  "
-          f"muon state name={opt.state_for_ckpt()['name']}")
